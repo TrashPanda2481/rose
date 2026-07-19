@@ -1,0 +1,36 @@
+# Rose
+
+From-scratch OS. Not Unix-derived, not NT-derived. Capability-based microkernel, Rust, QEMU-first.
+
+## Status
+
+Pre-code. Kernel invariants drafted. No boot yet.
+
+## Structure
+
+Project is split into cores. Each core owns its own README, CHANGELOG, BUGS, and TROUBLESHOOTING file. This file only tracks project-wide state.
+
+| Core | Purpose | Status |
+|---|---|---|
+| kernel | capabilities, IPC, address spaces, scheduler, boot handoff | spec drafted |
+
+## Design bets
+
+- Capabilities instead of Unix permissions. No ambient root.
+- IPC is the only kernel primitive. No large syscall table.
+- Userspace is a component graph, not a process tree.
+- No POSIX layer until the native model is proven. POSIX, if it ever exists, is a compat server bolted on later.
+
+## Non-goals (for now)
+
+Drivers beyond virtio, filesystems, networking, GUI, SMP, dynamic component loading. These get their own core + docs when they start.
+
+## Where things live
+
+- `docs/cores/<name>/` — per-core README, CHANGELOG, BUGS, TROUBLESHOOTING
+- `kernel/` — kernel source (not yet created)
+- `abi/` — shared types between kernel and userspace (not yet created)
+
+## Log format
+
+See `CHANGELOG.md` in this folder for project-level milestones. Per-core changelogs track implementation-level changes.
