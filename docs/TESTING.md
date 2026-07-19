@@ -2,13 +2,13 @@
 
 Two virtualizers. Different jobs.
 
-## QEMU — primary, automated
+## QEMU: primary, automated
 
 Every build gets tested here. Headless, scriptable, fast. This is the smoke test referenced in `BRANCHING.md`: boot the image, capture serial output, check for the expected line. No GUI, no manual steps, runs on every commit worth checking.
 
-## Oracle VM VirtualBox — secondary, manual, gate for stable
+## Oracle VM VirtualBox: secondary, manual, gate for stable
 
-Different firmware/BIOS implementation than QEMU's OVMF. A clean boot here means the kernel isn't just happening to work around a QEMU-specific quirk. Not run on every commit — run before a merge to `stable`, as a second opinion.
+Different firmware/BIOS implementation than QEMU's OVMF. A clean boot here means the kernel isn't just happening to work around a QEMU-specific quirk. Not run on every commit; run before a merge to `stable`, as a second opinion.
 
 Setup: raw disk image or ISO, same one built for QEMU. Serial port can be redirected to a host file for log capture, same as QEMU, so the check is comparable.
 

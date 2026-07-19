@@ -1,4 +1,4 @@
-# Changelog — kernel core
+# Changelog: kernel core
 
 Date, change, why. Newest first.
 

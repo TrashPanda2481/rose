@@ -1,6 +1,6 @@
-# Bugs — adaptive core
+# Bugs: adaptive core
 
-One entry per bug. Keep closed ones, don't delete — they're history.
+One entry per bug. Keep closed ones, don't delete; they're history.
 
 No entries yet. Core is unstarted.
 

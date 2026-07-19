@@ -1,4 +1,4 @@
-# Changelog — Rose (project level)
+# Changelog: Rose (project level)
 
 Format: date, what changed, why. Newest first.
 

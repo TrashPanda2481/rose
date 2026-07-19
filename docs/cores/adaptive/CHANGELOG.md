@@ -1,4 +1,4 @@
-# Changelog — adaptive core
+# Changelog: adaptive core
 
 Format: date, what changed, why. Newest first.
 

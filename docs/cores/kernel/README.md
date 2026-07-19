@@ -72,22 +72,22 @@ Message {
 }
 ```
 
-Open question: MAX_MSG_WORDS / MAX_MSG_CAPS size. Default 4 words / 2 caps. Small on purpose — forces bulk transfer through a real grant mechanism later instead of a bloated struct now.
+Open question: MAX_MSG_WORDS / MAX_MSG_CAPS size. Default 4 words / 2 caps. Small on purpose: forces bulk transfer through a real grant mechanism later instead of a bloated struct now.
 
 Three verbs:
-- Send — blocks if no receiver waiting / no queue space.
-- Receive — blocks until a Send arrives. `badge` tells you which minted cap the sender used.
-- Call — Send + implicit Receive on a kernel-generated one-shot Reply cap. Main pattern for request/response between components.
+- Send: blocks if no receiver waiting / no queue space.
+- Receive: blocks until a Send arrives. `badge` tells you which minted cap the sender used.
+- Call: Send + implicit Receive on a kernel-generated one-shot Reply cap. Main pattern for request/response between components.
 
 Interrupts and async events use Notification + Signal + Wait. No separate interrupt-handler concept. Same primitive as everything else.
 
 ## Address spaces
 
-One AddressSpace per component, built from PageTable/Frame objects retyped out of Untyped. No implicit kernel-visible-to-all region — kernel memory is structurally unmappable by components, not just off-limits by convention.
+One AddressSpace per component, built from PageTable/Frame objects retyped out of Untyped. No implicit kernel-visible-to-all region: kernel memory is structurally unmappable by components, not just off-limits by convention.
 
 Page faults: kernel doesn't resolve them. Converts fault into an IPC to a pager cap the component configured ahead of time. Pager decides map / kill / other. Mechanism stays in kernel, policy moves to userspace.
 
-Open question: one pager per component, or one shared root pager for v0.1? Default: shared root pager for now. Split once the component model itself is real — don't solve paging policy and component isolation at the same time.
+Open question: one pager per component, or one shared root pager for v0.1? Default: shared root pager for now. Split once the component model itself is real; don't solve paging policy and component isolation at the same time.
 
 No global address, no global path. Sharing between components only happens if one explicitly maps or lends a capability. Never a default.
 
@@ -95,12 +95,12 @@ No global address, no global path. Sharing between components only happens if on
 
 1. Bootloader (Limine) hands kernel a memory map, framebuffer, entry point.
 2. Kernel sets up its own state: frame allocator, page tables, IDT/GDT, timer.
-3. Kernel creates the root task — first and only privileged component — and gives it:
+3. Kernel creates the root task, first and only privileged component, and gives it:
    - Untyped caps covering all remaining physical memory
    - Caps to its own AddressSpace, Thread, CSpace
    - Cap to the boot console/serial device
    - A BootInfo page (plain data, not a cap): memory map, framebuffer geometry
-4. Kernel starts the root task's thread. Kernel never creates another component after this — root task does it by retyping Untyped memory.
+4. Kernel starts the root task's thread. Kernel never creates another component after this; root task does it by retyping Untyped memory.
 
 This is the only place authority comes from nothing. Every other capability in the system traces back to this handoff. If it doesn't trace back, something's wrong.
 
@@ -110,7 +110,7 @@ This is the only place authority comes from nothing. Every other capability in t
 - Priority: small int range (0-15), set at Thread config time, changeable by whoever holds the Thread cap.
 - One fixed timeslice for everyone at a given priority.
 - Preempt on timer tick or on block (Receive/Call/Wait with nothing to do).
-- No starvation handling. A saturated high-priority thread can starve everyone below it. Known gap, not fixing yet — IPC correctness comes first.
+- No starvation handling. A saturated high-priority thread can starve everyone below it. Known gap, not fixing yet: IPC correctness comes first.
 
 ## Open questions (blocking nothing yet, but need answers before code locks in)
 
@@ -120,4 +120,4 @@ This is the only place authority comes from nothing. Every other capability in t
 
 ## Naming/versioning
 
-This doc is v0.1. Breaking changes to the model bump the version and get a line in `CHANGELOG.md`. Object types, syscall numbers, and message labels live in one shared `abi` crate — never duplicated by hand on both sides of the kernel/userspace boundary.
+This doc is v0.1. Breaking changes to the model bump the version and get a line in `CHANGELOG.md`. Object types, syscall numbers, and message labels live in one shared `abi` crate, never duplicated by hand on both sides of the kernel/userspace boundary.

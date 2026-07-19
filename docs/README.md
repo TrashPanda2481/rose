@@ -13,7 +13,7 @@ Project is split into cores. Each core owns its own README, CHANGELOG, BUGS, and
 | Core | Purpose | Status |
 |---|---|---|
 | kernel | capabilities, IPC, address spaces, scheduler, boot handoff | boots (serial hello-world); capabilities/IPC/scheduler not implemented yet |
-| adaptive | real-time usage/intent understanding, native successor to Compass | deferred, stub only — see docs/cores/adaptive/README.md |
+| adaptive | real-time usage/intent understanding, native successor to Compass | deferred, stub only; see docs/cores/adaptive/README.md |
 
 See `docs/VISION.md` for the end-state goal and the bespoke-vs-standard heuristic behind these decisions.
 
@@ -30,9 +30,9 @@ Drivers beyond virtio, filesystems, networking, GUI, SMP, dynamic component load
 
 ## Where things live
 
-- `docs/cores/<name>/` — per-core README, CHANGELOG, BUGS, TROUBLESHOOTING
-- `kernel/` — kernel source (not yet created)
-- `abi/` — shared types between kernel and userspace (not yet created)
+- `docs/cores/<name>/`: per-core README, CHANGELOG, BUGS, TROUBLESHOOTING
+- `kernel/`: kernel source (not yet created)
+- `abi/`: shared types between kernel and userspace (not yet created)
 
 ## Log format
 

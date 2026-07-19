@@ -1,6 +1,6 @@
-# Bugs — kernel core
+# Bugs: kernel core
 
-One entry per bug. Keep closed ones, don't delete — they're history.
+One entry per bug. Keep closed ones, don't delete; they're history.
 
 Format:
 

@@ -1,6 +1,6 @@
-# Troubleshooting — adaptive core
+# Troubleshooting: adaptive core
 
-Problems hit during dev, and how they were solved. Not bugs in the design — friction with toolchain, QEMU, hardware, build.
+Problems hit during dev, and how they were solved. Not bugs in the design: friction with toolchain, QEMU, hardware, build.
 
 No entries yet. Core is unstarted.
 

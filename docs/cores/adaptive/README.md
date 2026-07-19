@@ -4,7 +4,7 @@ Status: deferred. No spec, no code. Placeholder so the goal isn't forgotten.
 
 ## What this is
 
-The real-time usage/intent layer described in `docs/VISION.md`. The native successor to Compass (the guidance app from the Meridian-OS project) — same idea, but as an OS-level capability instead of a userspace tool sitting on top of a generic system.
+The real-time usage/intent layer described in `docs/VISION.md`. The native successor to Compass (the guidance app from the Meridian-OS project): same idea, but as an OS-level capability instead of a userspace tool sitting on top of a generic system.
 
 ## Why there's nothing here yet
 
