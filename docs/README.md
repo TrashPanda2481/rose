@@ -34,3 +34,7 @@ Drivers beyond virtio, filesystems, networking, GUI, SMP, dynamic component load
 ## Log format
 
 See `CHANGELOG.md` in this folder for project-level milestones. Per-core changelogs track implementation-level changes.
+
+## Branching
+
+Two branches: `main` (active work, can be broken) and `stable` (only known-good boots land here). See `docs/BRANCHING.md`.
