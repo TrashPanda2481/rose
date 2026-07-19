@@ -4,7 +4,7 @@ From-scratch OS. Not Unix-derived, not NT-derived. Capability-based microkernel,
 
 ## Status
 
-Pre-code. Kernel invariants drafted. No boot yet.
+Boots. Kernel reaches its entry point and prints over serial on both BIOS and UEFI in QEMU. Everything past boot + serial (capabilities, IPC, scheduler, drivers) is still spec, not code.
 
 ## Structure
 
@@ -12,7 +12,7 @@ Project is split into cores. Each core owns its own README, CHANGELOG, BUGS, and
 
 | Core | Purpose | Status |
 |---|---|---|
-| kernel | capabilities, IPC, address spaces, scheduler, boot handoff | spec drafted |
+| kernel | capabilities, IPC, address spaces, scheduler, boot handoff | boots (serial hello-world); capabilities/IPC/scheduler not implemented yet |
 
 ## Design bets
 

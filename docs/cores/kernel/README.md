@@ -1,6 +1,15 @@
 # Kernel core
 
-Status: spec drafted, no code yet.
+Status: boots. Entry point + serial output working on BIOS and UEFI in QEMU. Capabilities/IPC/scheduler below are still spec only, not implemented.
+
+## Boot, concretely
+
+- Target: built-in `x86_64-unknown-none` (see TROUBLESHOOTING.md for why not a custom json target).
+- Bootloader: Limine, `v11.x-binary` release, vendored under `boot/limine-bootloader/`.
+- Entry: `kernel_main`, reached via Limine protocol requests + base revision check.
+- First hardware interface: COM1 UART (port I/O, no MMIO/framebuffer needed). Same driver backs the panic handler.
+- Build/run: `tools/build-iso.sh`, `tools/run-bios.sh`, `tools/run-uefi.sh`, `tools/smoke-test.sh`.
+- Smoke test line: `rose: hello, hardware`.
 
 Scope for v0.1: capabilities, CSpace, IPC (register-only), address spaces, boot handoff, scheduler. Nothing else. Drivers, storage, networking, GUI, SMP come later as their own cores.
 

@@ -1,0 +1,6 @@
+/kernel/target/
+/iso_root/
+/rose.iso
+/.scratch/
+/boot/limine-bootloader/limine
+*.log

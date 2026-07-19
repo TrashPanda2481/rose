@@ -1,0 +1,17 @@
+[package]
+name = "rose-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rose-kernel"
+path = "src/main.rs"
+
+[dependencies]
+limine = "0.6.5"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
