@@ -38,3 +38,11 @@ See `CHANGELOG.md` in this folder for project-level milestones. Per-core changel
 ## Branching
 
 Two branches: `main` (active work, can be broken) and `stable` (only known-good boots land here). See `docs/BRANCHING.md`.
+
+## Testing
+
+QEMU for automated smoke tests, Oracle VM VirtualBox as a second-opinion check before stable promotion. See `docs/TESTING.md`.
+
+## Repo visibility
+
+Private. Not published anywhere public.

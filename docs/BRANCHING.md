@@ -6,13 +6,9 @@ Two branches. That's it, no more until there's a real reason.
 Active work. Can be broken between commits. This is where cores get built, invariants get revised, code gets written and fixed.
 
 ## stable
-Only receives merges from main, never worked on directly. A merge to stable is only allowed when:
+Only receives merges from main, never worked on directly. Full promotion checklist lives in `TESTING.md` — short version: builds clean, boots in QEMU with smoke test passing, boots in VirtualBox too.
 
-1. It builds clean.
-2. It boots in QEMU.
-3. The smoke test (serial log check, see `tools/`) passes.
-
-If those three aren't true, it doesn't go to stable. No exceptions for "it's basically done."
+If that's not true, it doesn't go to stable. No exceptions for "it's basically done."
 
 ## Merge log
 
