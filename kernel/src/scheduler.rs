@@ -129,9 +129,21 @@ pub fn spawn(entry: fn()) -> usize {
 /// out. No cli/sti needed: the resumed task's own path back out (either
 /// this same interrupt path's `iretq`, or a later `yield_now`) is what
 /// restores IF correctly for whenever it's scheduled again.
+///
+/// `init()` must run before interrupts are ever enabled, so `tasks` is
+/// never actually empty here in a correctly-ordered boot. Guarded
+/// anyway rather than trusting that ordering: this runs from inside a
+/// real hardware interrupt on real machines, where a tick can land at
+/// any instruction boundary the instant IF goes high, not just at
+/// times this kernel's own code chooses to poll something. A modulo by
+/// an empty queue would panic and halt the whole machine over what's
+/// really just a boot-sequencing question, not a correctness one.
 pub fn tick() {
     let (old_rsp_ptr, new_rsp) = {
         let mut scheduler = SCHEDULER.lock();
+        if scheduler.tasks.is_empty() {
+            return;
+        }
         scheduler.ticks_left = scheduler.ticks_left.saturating_sub(1);
         if scheduler.ticks_left > 0 {
             return;

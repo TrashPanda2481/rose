@@ -118,6 +118,17 @@ unsafe extern "C" fn kernel_main() -> ! {
 
     heap_selftest(&mut com1);
 
+    // Must happen before pic::init()/timer::init() ever let IF go high:
+    // scheduler::tick() runs unconditionally from every timer IRQ, and
+    // on real hardware (unlike this sandbox's QEMU/TCG) the first tick
+    // can land the instant sti executes. An empty task list at that
+    // point used to panic (modulo by zero); see BUGS.md. Registering
+    // task 0 here first means tick() always has at least one task, so
+    // it's a safe no-op switch until spawn() adds more later.
+    unsafe {
+        scheduler::init();
+    }
+
     unsafe {
         pic::init();
     }
@@ -336,9 +347,9 @@ fn task_b() {
 /// preemption itself is only visible opportunistically via switches()
 /// counting higher than the 20 voluntary yields below would alone.
 fn scheduler_selftest(com1: &mut serial::Serial) {
-    unsafe {
-        scheduler::init();
-    }
+    // scheduler::init() already ran earlier in kernel_main, before
+    // interrupts were enabled; calling it again here would double-push
+    // task 0.
     scheduler::spawn(task_a);
     scheduler::spawn(task_b);
 
