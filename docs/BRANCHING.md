@@ -17,7 +17,7 @@ Track every main → stable merge here. Newest first.
 ```
 Date        Commit      What it proves works
 ----        ------      ---------------------
-(none yet)
+2026-07-25  9235f89     Kernel boots and reaches the smoke-test serial output on both QEMU (BIOS+UEFI) and Oracle VM VirtualBox.
 ```
 
 ## Why two branches and not more
