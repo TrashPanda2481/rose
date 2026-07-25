@@ -146,6 +146,8 @@ unsafe extern "C" fn kernel_main() -> ! {
 
     scheduler_selftest(&mut com1);
 
+    scheduled_address_space_selftest(&mut com1);
+
     usermode_selftest(&mut com1)
 }
 
@@ -528,6 +530,116 @@ fn scheduler_selftest(com1: &mut serial::Serial) {
         TASK_A_COUNT.load(Ordering::Relaxed),
         TASK_B_COUNT.load(Ordering::Relaxed),
         scheduler::switches()
+    );
+}
+
+const SCHEDULED_AS_TEST_VIRT: u64 = 0x0000_0000_0030_0000;
+const SCHEDULED_AS_PATTERN_A: u64 = 0x1111_1111_2222_2222;
+const SCHEDULED_AS_PATTERN_B: u64 = 0x3333_3333_4444_4444;
+static TASK_C_RESULT: AtomicU64 = AtomicU64::new(0);
+static TASK_D_RESULT: AtomicU64 = AtomicU64::new(0);
+static SCHEDULED_AS_TASKS_DONE: AtomicU64 = AtomicU64::new(0);
+
+// Same virtual address as task_d, deliberately: the whole point is that
+// each of these runs under a different CR3, so the two writes land in
+// two entirely separate physical frames despite sharing a vaddr. Writes
+// its own pattern once, yields several times so real round-robin
+// switching (including task_a/task_b/task 0 also in the ring by this
+// point) happens in between, then reads back and stores the result for
+// the parent to check. Loops forever afterward rather than parking,
+// same reason as task_a/task_b above: a task stuck outside yield_now
+// would freeze the whole ring.
+fn task_c() {
+    let ptr = SCHEDULED_AS_TEST_VIRT as *mut u64;
+    unsafe {
+        ptr.write_volatile(SCHEDULED_AS_PATTERN_A);
+    }
+    for _ in 0..5u64 {
+        scheduler::yield_now();
+    }
+    let readback = unsafe { ptr.read_volatile() };
+    TASK_C_RESULT.store(readback, Ordering::Relaxed);
+    SCHEDULED_AS_TASKS_DONE.fetch_add(1, Ordering::Relaxed);
+    loop {
+        scheduler::yield_now();
+    }
+}
+
+fn task_d() {
+    let ptr = SCHEDULED_AS_TEST_VIRT as *mut u64;
+    unsafe {
+        ptr.write_volatile(SCHEDULED_AS_PATTERN_B);
+    }
+    for _ in 0..5u64 {
+        scheduler::yield_now();
+    }
+    let readback = unsafe { ptr.read_volatile() };
+    TASK_D_RESULT.store(readback, Ordering::Relaxed);
+    SCHEDULED_AS_TASKS_DONE.fetch_add(1, Ordering::Relaxed);
+    loop {
+        scheduler::yield_now();
+    }
+}
+
+/// Proves the scheduler actually reloads CR3 per task, not just that a
+/// single manual `AddressSpace::switch()` works in isolation (already
+/// covered by `address_space_selftest`). Builds two AddressSpaces, maps
+/// the same virtual address in each to a different physical frame with
+/// a different pattern, then spawns one task into each via
+/// `scheduler::spawn_in`. By the time both report done, they've been
+/// preempted and resumed several times each, interleaved with task_a,
+/// task_b, and task 0's own wait loop, all of which keep running in the
+/// kernel's own AddressSpace throughout. If either task ever read back
+/// the other's pattern, or the kernel's own code somehow faulted mid-
+/// ring, CR3 wasn't actually following the scheduler.
+///
+/// No unmap/free of the two test frames afterward: task_c/task_d loop
+/// forever like task_a/task_b do, so the mappings need to stay valid
+/// for the rest of boot anyway. Same no-teardown scope cut as
+/// everywhere else address spaces show up so far.
+fn scheduled_address_space_selftest(com1: &mut serial::Serial) {
+    let as_a = unsafe { paging::new_address_space() };
+    let as_b = unsafe { paging::new_address_space() };
+
+    let phys_a = mem::FRAME_ALLOCATOR
+        .lock()
+        .alloc()
+        .expect("rose: scheduled address space self-test: out of memory");
+    let phys_b = mem::FRAME_ALLOCATOR
+        .lock()
+        .alloc()
+        .expect("rose: scheduled address space self-test: out of memory");
+
+    unsafe {
+        as_a.map_page(
+            SCHEDULED_AS_TEST_VIRT,
+            phys_a,
+            paging::PAGE_WRITABLE | paging::PAGE_NO_EXECUTE,
+        );
+        as_b.map_page(
+            SCHEDULED_AS_TEST_VIRT,
+            phys_b,
+            paging::PAGE_WRITABLE | paging::PAGE_NO_EXECUTE,
+        );
+    }
+
+    scheduler::spawn_in(task_c, as_a);
+    scheduler::spawn_in(task_d, as_b);
+
+    while SCHEDULED_AS_TASKS_DONE.load(Ordering::Relaxed) < 2 {
+        scheduler::yield_now();
+    }
+
+    let a_ok = TASK_C_RESULT.load(Ordering::Relaxed) == SCHEDULED_AS_PATTERN_A;
+    let b_ok = TASK_D_RESULT.load(Ordering::Relaxed) == SCHEDULED_AS_PATTERN_B;
+    let _ = writeln!(
+        com1,
+        "rose: scheduled address space self-test: task_c read {:#018x} ({}), task_d read {:#018x} ({}), isolation across scheduling {}",
+        TASK_C_RESULT.load(Ordering::Relaxed),
+        if a_ok { "match" } else { "MISMATCH" },
+        TASK_D_RESULT.load(Ordering::Relaxed),
+        if b_ok { "match" } else { "MISMATCH" },
+        if a_ok && b_ok { "confirmed" } else { "FAILED" }
     );
 }
 
