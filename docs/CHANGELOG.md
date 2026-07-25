@@ -2,6 +2,10 @@
 
 Format: date, what changed, why. Newest first.
 
+## 2026-07-25
+
+- Kernel boot verified in Oracle VM VirtualBox, matching QEMU serial output. Promoted `main` to `stable` (see `BRANCHING.md` merge log).
+
 ## 2026-07-19
 
 - Added `docs/VISION.md`: end-state goal (real-time usage understanding, adapts to the end user, native successor to Compass) and the bespoke-vs-standard heuristic. Added deferred `adaptive` core stub (README/CHANGELOG/BUGS/TROUBLESHOOTING, no design/code yet).

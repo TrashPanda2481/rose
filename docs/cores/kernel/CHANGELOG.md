@@ -2,6 +2,12 @@
 
 Date, change, why. Newest first.
 
+## 2026-07-25
+
+- Boot verified in Oracle VM VirtualBox, second virtualizer required by the stable promotion checklist. Serial log matches QEMU exactly: `rose: boot ok`, `rose: base revision supported`, `rose: hello, hardware`.
+- Two VirtualBox-specific issues hit and logged in `TROUBLESHOOTING.md`: VM created as a 32-bit guest type masked the long-mode CPUID bit (Limine panicked with "This CPU does not support 64-bit mode"), and raw-file serial capture failed with `VERR_INVALID_NAME` when pointed at a non-local drive.
+- Promoted to `stable`.
+
 ## 2026-07-19
 
 - v0.1 spec drafted: capability model, CSpace, object types, IPC format, address space model, boot handoff, scheduler policy.

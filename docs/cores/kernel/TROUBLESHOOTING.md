@@ -36,6 +36,18 @@ Symptom: kernel panics immediately with `assertion failed: BASE_REVISION.is_supp
 Root cause: cloned the `v9.x-binary` branch of the limine-bootloader repo, which predates the boot protocol base revision the `limine` 0.6.5 crate requests.
 Resolution: cloned `v11.x-binary` instead (latest binary branch), rebuilt `limine` deploy tool, rebuilt the ISO. Boot succeeded on both BIOS and UEFI after that.
 
+## VirtualBox VM created as 32-bit guest type hides long mode
+Context: first VirtualBox boot attempt, gating stable promotion.
+Symptom: Limine panics right after loading the kernel: `PANIC: limine: This CPU does not support 64-bit mode.`
+Root cause: VM was set up with a 32-bit guest OS type, which makes VirtualBox mask the long-mode CPUID bit from the guest regardless of what the host CPU supports.
+Resolution: changed the guest OS version to a 64-bit type under Settings > General > Basic, confirmed VT-x/AMD-V and PAE/NX enabled under Settings > System. Boot succeeded after that, matching QEMU's serial output exactly.
+
+## VirtualBox raw-file serial port fails with VERR_INVALID_NAME on a non-local drive
+Context: setting up serial log capture in VirtualBox to match the QEMU smoke-test setup.
+Symptom: `RawFile#0 failed to create the raw output file ... (VERR_INVALID_NAME)`. Same error on two different filenames in the same folder, so it wasn't a naming collision.
+Root cause: the raw file path pointed at a drive letter (an archive/external drive) that the VirtualBox backend process couldn't write to.
+Resolution: pointed the serial port's raw file at a local drive instead (`C:\rose-serial.log`). Worked immediately from there.
+
 ## OVMF `-bios` flag fails on 4M firmware variant
 Context: testing the UEFI boot path in QEMU.
 Symptom: `qemu: could not load PC BIOS '/usr/share/OVMF/OVMF_CODE_4M.fd'`.
