@@ -24,10 +24,23 @@
 //      the same thing across the CR3 switch; nothing in mem.rs needs to
 //      change.
 //
-// No user-mode mappings yet, no per-component address spaces. That's the
-// capability-model AddressSpace object in docs/cores/kernel/README.md,
-// still spec only. This is just the one address space the kernel itself
-// runs in.
+// AddressSpace is the primitive multiple page-table roots are built on:
+// the kernel's own, plus one per usermode component (see usermode.rs) or
+// self-test. Every AddressSpace shares PML4 entries 256..512 (HHDM plus
+// the kernel image, see NEW_ADDRESS_SPACE_SHARED_RANGE below) so the
+// kernel can always run and allocate regardless of which one is
+// currently loaded in CR3; entries 0..256 are private per AddressSpace.
+// This is conventional (pre-KPTI-style) kernel design: kernel memory is
+// present-but-supervisor-only in every AddressSpace, not structurally
+// absent from it. That's good enough for ring-3 isolation but doesn't
+// yet satisfy the stricter goal in docs/cores/kernel/README.md ("kernel
+// memory is structurally unmappable by components, not just off-limits
+// by convention"); flagged there as a known v0.1 limitation.
+//
+// The full capability-model AddressSpace object (Untyped-backed,
+// Map/Unmap-able PageTable/Frame caps) in docs/cores/kernel/README.md is
+// still spec only. This module is the mechanism it'll eventually sit on
+// top of, not that object itself.
 
 use limine::memmap;
 
@@ -41,11 +54,17 @@ const PAGE_HUGE: u64 = 1 << 7; // PS bit; only meaningful at the PD level here
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 const HUGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
 
-/// PML4 physical address of whatever table set `switch_to` last loaded into
-/// CR3. `map_page`/`unmap_page` operate on this, so anything called after
-/// `init()` doesn't need to carry a `&PageTables` around everywhere; there
-/// is only one address space right now anyway (see module docs above).
-static ACTIVE_PML4: SpinLock<Option<u64>> = SpinLock::new(None);
+/// PML4 index range shared into every AddressSpace by `new_address_space`:
+/// index 256 is the HHDM base (`0xffff800000000000` in this sandbox),
+/// index 511 is the kernel image's higher-half base
+/// (`0xffffffff80000000`). Entries below 256 are the private low/user
+/// half and stay zeroed for a fresh AddressSpace.
+const SHARED_PML4_RANGE: core::ops::Range<usize> = 256..512;
+
+/// PML4 physical address of the kernel's own page tables, set once by
+/// `init()`. `kernel_address_space()` reads this; `new_address_space()`
+/// copies the shared range out of it. Never changes after `init()`.
+static KERNEL_PML4: SpinLock<Option<u64>> = SpinLock::new(None);
 
 unsafe extern "C" {
     static __kernel_start: u8;
@@ -60,7 +79,12 @@ unsafe extern "C" {
 #[repr(align(4096))]
 struct PageTable([u64; 512]);
 
-struct PageTables {
+/// One page-table root: the kernel's own, or one built by
+/// `new_address_space` for a usermode component / self-test. Just a
+/// PML4 physical address; Copy on purpose, since it's a handle to
+/// state that lives in physical memory, not state itself.
+#[derive(Clone, Copy)]
+pub struct AddressSpace {
     pml4_phys: u64,
 }
 
@@ -68,14 +92,19 @@ struct PageTables {
 /// read by every `map_*` call afterward; never changes after that.
 static mut HHDM_OFFSET: u64 = 0;
 
-fn phys_to_virt(phys: u64) -> u64 {
+pub fn phys_to_virt(phys: u64) -> u64 {
     phys + unsafe { HHDM_OFFSET }
 }
 
 /// Allocates a frame from the physical allocator and zeroes it via the
-/// *existing* HHDM mapping (Limine's, still active until `switch_to` runs).
-/// Safety: caller must ensure HHDM_OFFSET is set and still maps this frame,
-/// true for the whole window between `build()` starting and `switch_to`.
+/// permanent HHDM alias. Safe to call both before and after the CR3
+/// switch in `init()`: before, it's still Limine's own HHDM; after,
+/// it's the kernel's, and either way `phys + HHDM_OFFSET` means the
+/// same thing (see module docs). This is also the mechanism a caller
+/// can use to write into a not-yet-active AddressSpace's frame, since
+/// dereferencing that frame's *target* virtual address doesn't work
+/// until that AddressSpace is loaded in CR3, but the HHDM alias always
+/// works regardless of which AddressSpace is active.
 unsafe fn alloc_zeroed_table() -> u64 {
     let phys = FRAME_ALLOCATOR
         .lock()
@@ -217,10 +246,10 @@ unsafe fn map_hhdm_range(pml4_phys: u64, base: u64, length: u64, hhdm_offset: u6
 }
 
 /// Builds a fresh set of kernel page tables. Does not switch to them,
-/// call `switch_to` once this returns. Safety: caller must ensure
+/// call `.switch()` once this returns. Safety: caller must ensure
 /// `hhdm_offset` and `memmap_entries` are the live values from Limine's
 /// responses, and that the frame allocator is already initialized.
-unsafe fn build(hhdm_offset: u64, memmap_entries: &[&memmap::Entry]) -> PageTables {
+unsafe fn build(hhdm_offset: u64, memmap_entries: &[&memmap::Entry]) -> AddressSpace {
     HHDM_OFFSET = hhdm_offset;
     enable_nx();
 
@@ -276,27 +305,12 @@ unsafe fn build(hhdm_offset: u64, memmap_entries: &[&memmap::Entry]) -> PageTabl
         map_hhdm_range(pml4_phys, entry.base, entry.length, hhdm_offset);
     }
 
-    PageTables { pml4_phys }
-}
-
-/// Loads CR3 with the new hierarchy. Flushes the entire TLB (no PCID in
-/// use), which is fine, this only happens once at boot on a single core.
-/// Safety: `tables` must cover every virtual address currently executing
-/// or about to be dereferenced, i.e. the whole kernel image plus whatever
-/// of the current stack the CPU needs next. True for `build`'s output as
-/// long as the boot stack Limine handed us lives inside a usable region.
-unsafe fn switch_to(tables: &PageTables) {
-    core::arch::asm!(
-        "mov cr3, {}",
-        in(reg) tables.pml4_phys,
-        options(nostack, preserves_flags),
-    );
-    *ACTIVE_PML4.lock() = Some(tables.pml4_phys);
+    AddressSpace { pml4_phys }
 }
 
 /// Builds the kernel's own page tables and switches to them. Called once
 /// from `kernel_main`, after the frame allocator and before anything that
-/// calls `map_page`/`unmap_page`.
+/// calls `map_page`/`unmap_page`/`new_address_space`.
 ///
 /// Design note (see docs/cores/kernel/README.md boot order): GDT/IDT got
 /// built before this, on Limine's page tables, since neither needs its own
@@ -307,52 +321,157 @@ unsafe fn switch_to(tables: &PageTables) {
 ///
 /// Safety: same contract as `build`.
 pub unsafe fn init(hhdm_offset: u64, memmap_entries: &[&memmap::Entry]) {
-    let tables = build(hhdm_offset, memmap_entries);
-    switch_to(&tables);
-    // `tables` is deliberately leaked here, not dropped: the page table
-    // frames it describes now back the running kernel's own address
-    // space and must outlive this function. PageTables has no Drop impl,
-    // so this is just letting it go out of scope; nothing is freed.
+    let kernel_as = build(hhdm_offset, memmap_entries);
+    kernel_as.switch();
+    *KERNEL_PML4.lock() = Some(kernel_as.pml4_phys);
+    // kernel_as's page-table frames now back the running kernel's own
+    // address space and must outlive this function; they do, since
+    // they're addressed by physical frame, not by this local going out
+    // of scope. AddressSpace is Copy and has no Drop, so there's
+    // nothing to leak here, just a handle ceasing to exist.
 }
 
-/// Maps one 4K page into the currently active address space. Panics if
-/// `init()` hasn't run yet, mapping without an active table set is always
-/// a bug, not a runtime condition to handle gracefully.
-///
-/// Safety: caller must ensure `phys` is a frame it owns (typically fresh
-/// from `FRAME_ALLOCATOR`) and that `virt` isn't already mapped to
-/// something else still in use.
-pub unsafe fn map_page(virt: u64, phys: u64, flags: u64) {
-    let pml4_phys = ACTIVE_PML4.lock().expect("rose: map_page before paging::init");
-    map_4k(pml4_phys, virt, phys, flags);
-    invlpg(virt);
+/// Returns a handle to the kernel's own address space. Panics if called
+/// before `init()`, same as every other "used before init" case in this
+/// module: not a runtime condition to handle, a bug to fix at the
+/// call site.
+pub fn kernel_address_space() -> AddressSpace {
+    AddressSpace {
+        pml4_phys: KERNEL_PML4
+            .lock()
+            .expect("rose: kernel_address_space before paging::init"),
+    }
 }
 
-/// Unmaps a single 4K page from the currently active address space and
-/// invalidates its TLB entry. Does not free the underlying physical frame,
-/// that's the caller's responsibility (via `FRAME_ALLOCATOR::free`) since
-/// this layer has no way to know whether the frame is still referenced
-/// from anywhere else.
+/// Allocates a fresh PML4 and copies the kernel's shared upper half
+/// (HHDM + kernel image, PML4 entries 256..512, see SHARED_PML4_RANGE)
+/// into it. The lower half (256 entries, this AddressSpace's private
+/// low/user range) stays zeroed. Every component gets the kernel
+/// mapped in as present-but-supervisor-only, so the kernel can always
+/// run and allocate no matter which AddressSpace CR3 currently points
+/// at; see module docs for why that's not yet the stricter
+/// structurally-unmappable goal.
 ///
-/// Safety: caller must ensure `virt` was previously mapped and nothing
-/// still holds a live reference through it.
-pub unsafe fn unmap_page(virt: u64) {
-    let pml4_phys = ACTIVE_PML4.lock().expect("rose: unmap_page before paging::init");
-    let pml4 = table_at(pml4_phys);
-    if pml4.0[index(virt, 3)] & PAGE_PRESENT == 0 {
-        return;
+/// Safety: caller must ensure `init()` has already run.
+pub unsafe fn new_address_space() -> AddressSpace {
+    let pml4_phys = alloc_zeroed_table();
+    let kernel_pml4_phys = KERNEL_PML4
+        .lock()
+        .expect("rose: new_address_space before paging::init");
+
+    // Two live &mut PageTable at once looks like aliasing but isn't:
+    // the two physical frames are genuinely distinct (one just
+    // allocated above, one already backing the kernel), so this is
+    // two disjoint mutable borrows of two disjoint memory regions, not
+    // one region borrowed twice.
+    let kernel_pml4 = table_at(kernel_pml4_phys);
+    let new_pml4 = table_at(pml4_phys);
+    for i in SHARED_PML4_RANGE {
+        new_pml4.0[i] = kernel_pml4.0[i];
     }
-    let pdpt = table_at(pml4.0[index(virt, 3)] & ADDR_MASK);
-    if pdpt.0[index(virt, 2)] & PAGE_PRESENT == 0 {
-        return;
+
+    AddressSpace { pml4_phys }
+}
+
+impl AddressSpace {
+    /// Loads CR3 with this address space's PML4. Flushes the entire
+    /// TLB (no PCID in use). Safety: `self` must cover every virtual
+    /// address currently executing or about to be dereferenced right
+    /// after the switch, i.e. the whole kernel image plus whatever of
+    /// the current stack the CPU needs next. Always true right after
+    /// `new_address_space()` (kernel half is shared in) as long as the
+    /// caller doesn't jump to a user address before also mapping it.
+    pub unsafe fn switch(&self) {
+        core::arch::asm!(
+            "mov cr3, {}",
+            in(reg) self.pml4_phys,
+            options(nostack, preserves_flags),
+        );
     }
-    let pd = table_at(pdpt.0[index(virt, 2)] & ADDR_MASK);
-    if pd.0[index(virt, 1)] & PAGE_PRESENT == 0 || pd.0[index(virt, 1)] & PAGE_HUGE != 0 {
-        return;
+
+    /// Maps one 4K page into this address space.
+    ///
+    /// Safety: caller must ensure `phys` is a frame it owns (typically
+    /// fresh from `FRAME_ALLOCATOR`) and that `virt` isn't already
+    /// mapped to something else still in use. If this AddressSpace
+    /// isn't the one currently loaded in CR3, the mapping still takes
+    /// effect (it's written straight into the page tables via their
+    /// HHDM alias) but won't be visible to code running under it until
+    /// `.switch()` loads it; see usermode.rs for the pattern of mapping
+    /// a not-yet-active AddressSpace, then writing through
+    /// `phys_to_virt` rather than through the target virtual address,
+    /// then switching.
+    pub unsafe fn map_page(&self, virt: u64, phys: u64, flags: u64) {
+        map_4k(self.pml4_phys, virt, phys, flags);
+        // Targets whatever's currently loaded in CR3, which may not be
+        // `self` if this AddressSpace isn't active yet. Harmless
+        // either way: if `self` isn't active, there's no stale TLB
+        // entry for this virt to invalidate in the first place, and
+        // `.switch()` does an unconditional full flush regardless of
+        // which AddressSpace it's switching to.
+        invlpg(virt);
     }
-    let pt = table_at(pd.0[index(virt, 1)] & ADDR_MASK);
-    pt.0[index(virt, 0)] = 0;
-    invlpg(virt);
+
+    /// Unmaps a single 4K page from this address space and invalidates
+    /// its TLB entry (same currently-loaded-CR3 caveat as `map_page`).
+    /// Does not free the underlying physical frame, that's the
+    /// caller's responsibility (via `FRAME_ALLOCATOR::free`) since this
+    /// layer has no way to know whether the frame is still referenced
+    /// from anywhere else.
+    ///
+    /// Safety: caller must ensure `virt` was previously mapped in this
+    /// address space and nothing still holds a live reference through
+    /// it.
+    pub unsafe fn unmap_page(&self, virt: u64) {
+        let pml4 = table_at(self.pml4_phys);
+        if pml4.0[index(virt, 3)] & PAGE_PRESENT == 0 {
+            return;
+        }
+        let pdpt = table_at(pml4.0[index(virt, 3)] & ADDR_MASK);
+        if pdpt.0[index(virt, 2)] & PAGE_PRESENT == 0 {
+            return;
+        }
+        let pd = table_at(pdpt.0[index(virt, 2)] & ADDR_MASK);
+        if pd.0[index(virt, 1)] & PAGE_PRESENT == 0 || pd.0[index(virt, 1)] & PAGE_HUGE != 0 {
+            return;
+        }
+        let pt = table_at(pd.0[index(virt, 1)] & ADDR_MASK);
+        pt.0[index(virt, 0)] = 0;
+        invlpg(virt);
+    }
+
+    /// Read-only table walk checking whether `virt` is PRESENT in this
+    /// address space, without ever dereferencing `virt` itself, only
+    /// the page-table entries that describe it (via their HHDM alias,
+    /// same as every other table walk in this module). Safe to call on
+    /// an address that would fault if actually accessed; that's the
+    /// point, this is how a caller proves a page is or isn't mapped
+    /// before touching it. Treats a present huge (2MiB) leaf at the PD
+    /// level as mapped without walking further, unlike `unmap_page`
+    /// which just leaves huge leaves alone.
+    ///
+    /// Safety: caller must ensure this AddressSpace was actually built
+    /// by `new_address_space` or is the kernel's own; walking garbage
+    /// physical addresses through `table_at` is undefined otherwise.
+    pub unsafe fn is_mapped(&self, virt: u64) -> bool {
+        let pml4 = table_at(self.pml4_phys);
+        if pml4.0[index(virt, 3)] & PAGE_PRESENT == 0 {
+            return false;
+        }
+        let pdpt = table_at(pml4.0[index(virt, 3)] & ADDR_MASK);
+        if pdpt.0[index(virt, 2)] & PAGE_PRESENT == 0 {
+            return false;
+        }
+        let pd = table_at(pdpt.0[index(virt, 2)] & ADDR_MASK);
+        if pd.0[index(virt, 1)] & PAGE_PRESENT == 0 {
+            return false;
+        }
+        if pd.0[index(virt, 1)] & PAGE_HUGE != 0 {
+            return true;
+        }
+        let pt = table_at(pd.0[index(virt, 1)] & ADDR_MASK);
+        pt.0[index(virt, 0)] & PAGE_PRESENT != 0
+    }
 }
 
 unsafe fn invlpg(virt: u64) {

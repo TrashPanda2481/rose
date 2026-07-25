@@ -4,8 +4,9 @@
 // this has nothing to do with per-component memory later, that's Untyped
 // retyping through the capability model in docs/cores/kernel/README.md.
 //
-// Fixed virtual region, eagerly mapped in full at init() via paging::map_page,
-// one physical frame per page from the frame allocator. No growth-on-demand
+// Fixed virtual region, eagerly mapped in full at init() via the kernel
+// address space's map_page, one physical frame per page from the frame
+// allocator. No growth-on-demand
 // yet: if the heap fills up, alloc returns null like any other GlobalAlloc
 // failure. Revisit once something actually needs more than HEAP_SIZE at
 // once; nothing does yet.
@@ -82,6 +83,7 @@ fn align_up(addr: u64, align: u64) -> u64 {
 /// block spanning it. Safety: caller must ensure the frame allocator and
 /// paging are already initialized, and this runs exactly once.
 pub unsafe fn init() {
+    let kernel_as = paging::kernel_address_space();
     let pages = HEAP_SIZE / FRAME_SIZE;
     for i in 0..pages {
         let phys = FRAME_ALLOCATOR
@@ -89,7 +91,7 @@ pub unsafe fn init() {
             .alloc()
             .expect("rose: heap init: out of memory");
         unsafe {
-            paging::map_page(
+            kernel_as.map_page(
                 HEAP_START + i * FRAME_SIZE,
                 phys,
                 paging::PAGE_WRITABLE | paging::PAGE_NO_EXECUTE,
