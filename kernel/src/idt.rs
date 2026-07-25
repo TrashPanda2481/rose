@@ -1,25 +1,32 @@
 // Interrupt Descriptor Table, v0.1.
 //
-// Covers only the 32 real CPU exception vectors. Vectors 32-255 (device
-// IRQs) are left not-present on purpose: nothing unmasks a PIC/APIC yet,
-// so no external interrupt can legitimately arrive. If one somehow did,
-// using a not-present gate turns it into a #GP, which we do handle, so it
-// still gets logged instead of vanishing into an undefined CPU state.
+// Covers the 32 real CPU exception vectors plus vector 32 (IRQ0, PIT
+// timer, see pic.rs/timer.rs) now that something actually unmasks and
+// drives a hardware interrupt line. Vectors 33-255 are still left
+// not-present on purpose: nothing else is unmasked at the PIC yet, so no
+// other external interrupt can legitimately arrive. If one somehow did,
+// a not-present gate turns it into a #GP, which we do handle, so it still
+// gets logged instead of vanishing into an undefined CPU state.
 //
 // Every stub is hand-written asm, not the unstable `x86-interrupt` Rust
 // ABI. Slightly more code, but the stack layout is fully ours to see and
 // name, nothing about it depends on how a future compiler happens to
 // lower an experimental calling convention.
 //
-// Everything here is fatal except the breakpoint (#BP), which logs and
-// returns; that's what the self-test in main.rs uses to prove the whole
-// GDT/IDT/TSS chain works without having to crash the kernel to prove it.
+// Every CPU exception here is fatal except the breakpoint (#BP), which
+// logs and returns; that's what the self-test in main.rs uses to prove
+// the whole GDT/IDT/TSS chain works without having to crash the kernel
+// to prove it. Vector 32 (the timer tick) is not an exception at all and
+// is dispatched separately, before the exception-logging path: it just
+// bumps the tick counter, sends EOI, and returns, every 10ms, silently.
 
 use core::fmt::Write;
 
 use crate::gdt::{DOUBLE_FAULT_IST_INDEX, KERNEL_CODE_SELECTOR};
 use crate::mem::SpinLock;
+use crate::pic;
 use crate::serial;
+use crate::timer;
 
 #[repr(C)]
 struct SavedRegs {
@@ -152,9 +159,17 @@ fn read_cr2() -> u64 {
 #[unsafe(no_mangle)]
 extern "C" fn rose_exception_handler(frame: *mut InterruptFrame) {
     let frame = unsafe { &*frame };
-    let mut com1 = serial::Serial::init();
-
     let vector = frame.vector;
+
+    if vector == pic::IRQ0_TIMER_VECTOR {
+        // Not an exception; a hardware tick. No logging on the hot path,
+        // every serial write here would mean 100 lines/sec forever.
+        timer::on_tick();
+        unsafe { pic::send_eoi(0) };
+        return;
+    }
+
+    let mut com1 = serial::Serial::init();
     let rip = frame.rip;
     let error_code = frame.error_code;
 
@@ -283,6 +298,7 @@ define_stub!(stub_28, 28, no_error_code);
 define_stub!(stub_29, 29, has_error_code);
 define_stub!(stub_30, 30, has_error_code);
 define_stub!(stub_31, 31, no_error_code);
+define_stub!(stub_32, 32, no_error_code);
 
 /// Loads the IDT. Safety: caller must call this exactly once, after
 /// `gdt::init`, since gates reference `KERNEL_CODE_SELECTOR` and the
@@ -321,6 +337,7 @@ pub unsafe fn init() {
     idt[29].set(stub_29 as *const () as u64, 0);
     idt[30].set(stub_30 as *const () as u64, 0);
     idt[31].set(stub_31 as *const () as u64, 0);
+    idt[32].set(stub_32 as *const () as u64, 0);
 
     let pointer = DescriptorTablePointer {
         limit: (core::mem::size_of::<[Entry; 256]>() - 1) as u16,

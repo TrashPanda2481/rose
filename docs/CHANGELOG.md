@@ -8,6 +8,7 @@ Format: date, what changed, why. Newest first.
 - Memory bring-up: kernel parses Limine's memory map and logs every region over serial. Physical frame allocator built on top (free-list, HHDM-addressed, self-test on boot). Verified on QEMU BIOS+UEFI and Oracle VM VirtualBox. Promoted `main` to `stable` again (see `BRANCHING.md` merge log).
 - GDT/IDT and kernel-owned page tables added (all 32 exception vectors, double-fault IST stack, W^X kernel image mapping, HHDM remap, map/unmap self-tests). Verified on QEMU BIOS+UEFI only so far; VirtualBox verification deliberately deferred, both still on `main` only, not yet in `stable`.
 - Kernel heap added (free-list first-fit, 1MiB fixed region, backs `extern crate alloc`). Self-test exercises Box and a growing Vec, confirms memory returns on drop. Verified on QEMU BIOS+UEFI only; still on `main` only, not yet in `stable`.
+- PIC + PIT timer added (IRQ0 remapped to vector 32, 100Hz). Hit a real bug: hardware IRQ0 never reaches the CPU in this sandbox's QEMU/TCG despite verified-correct PIC/PIT programming; IDT dispatch/EOI/tick-counting confirmed correct via software-triggered interrupt instead. Left open in `BUGS.md` pending a non-sandboxed repro; boot self-test now timeout-bounded instead of hanging. Verified on QEMU BIOS+UEFI only; still on `main` only, not yet in `stable`.
 
 ## 2026-07-19
 

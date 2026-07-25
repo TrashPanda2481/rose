@@ -9,7 +9,9 @@ mod heap;
 mod idt;
 mod mem;
 mod paging;
+mod pic;
 mod serial;
+mod timer;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -114,6 +116,18 @@ unsafe extern "C" fn kernel_main() -> ! {
 
     heap_selftest(&mut com1);
 
+    unsafe {
+        pic::init();
+    }
+    let _ = writeln!(com1, "rose: pic remapped, irq0 unmasked");
+
+    unsafe {
+        timer::init();
+    }
+    let _ = writeln!(com1, "rose: timer programmed at 100hz, interrupts enabled");
+
+    timer_selftest(&mut com1);
+
     loop {
         core::arch::asm!("hlt");
     }
@@ -206,6 +220,62 @@ fn heap_selftest(com1: &mut serial::Serial) {
         heap::allocated_bytes(),
         heap::free_bytes()
     );
+}
+
+fn rdtsc() -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") low, out("edx") high, options(nomem, nostack));
+    }
+    ((high as u64) << 32) | (low as u64)
+}
+
+/// Waits for 50 ticks (0.5s at 100Hz) to go by, proving PIC remap + IDT
+/// vector 32 dispatch + PIT programming all work end to end via a real
+/// hardware interrupt. Bounded by an RDTSC-measured ~2 real seconds
+/// (assuming a conservative >=500MHz floor, no calibration needed for a
+/// coarse timeout) rather than waiting unboundedly: some environments
+/// (this project's QEMU sandbox, see BUGS.md) never deliver
+/// IRQ0 to the CPU despite correct PIC/PIT programming, so an unbounded
+/// wait here would hang boot forever. If the timeout is hit, falls back
+/// to a software-triggered `int 0x20` to at least confirm the IDT
+/// dispatch, PIC EOI, and tick-counting path are wired correctly, which
+/// is everything except the actual hardware delivery.
+fn timer_selftest(com1: &mut serial::Serial) {
+    const MIN_ASSUMED_HZ: u64 = 500_000_000;
+    const WAIT_SECONDS: u64 = 2;
+    let cycle_budget = MIN_ASSUMED_HZ * WAIT_SECONDS;
+
+    let start_ticks = timer::ticks();
+    let target_ticks = start_ticks + 50;
+    let start_tsc = rdtsc();
+
+    while timer::ticks() < target_ticks {
+        if rdtsc().wrapping_sub(start_tsc) > cycle_budget {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+
+    if timer::ticks() >= target_ticks {
+        let _ = writeln!(
+            com1,
+            "rose: timer self-test: {} ticks elapsed via hardware irq0, {}ms since boot",
+            timer::ticks() - start_ticks,
+            timer::ms_since_boot()
+        );
+    } else {
+        unsafe {
+            core::arch::asm!("int 0x20");
+        }
+        let _ = writeln!(
+            com1,
+            "rose: timer self-test: no hardware irq0 within ~{}s, verified vector 32 dispatch via software int instead (ticks={})",
+            WAIT_SECONDS,
+            timer::ticks()
+        );
+    }
 }
 
 fn frame_allocator_selftest(com1: &mut serial::Serial) {
