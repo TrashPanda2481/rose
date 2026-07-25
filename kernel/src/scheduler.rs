@@ -17,8 +17,18 @@
 // task via round-robin and drive the same `context_switch`; they differ
 // only in how they handle interrupts around the switch, see the comments
 // on each below.
+//
+// Each Task now also carries the AddressSpace it runs in. `spawn`
+// defaults to the kernel's own, matching every task before this
+// feature; `spawn_in` picks a specific one. Both tick() and
+// yield_now() reload CR3 for the incoming task right before
+// context_switch, unconditionally for now (no same-AS skip yet, see
+// the comment at each call site). This is what makes it possible for
+// a future component to actually run isolated in its own AddressSpace
+// under real preemption, not just a single manual switch.
 
 use crate::mem::SpinLock;
+use crate::paging::{self, AddressSpace};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -33,6 +43,12 @@ struct Task {
     // stack alive for as long as the Task exists, since nothing else
     // holds a reference to it.
     _stack: Option<Box<[u8]>>,
+    // Every task before this feature ran in the kernel's own
+    // AddressSpace implicitly, since nothing here ever touched CR3.
+    // Now each task carries the one it should be running in; `spawn`
+    // defaults to the kernel's, `spawn_in` picks any. Copy type (a
+    // PML4 physical address), cheap to hold by value.
+    address_space: AddressSpace,
 }
 
 struct Scheduler {
@@ -57,6 +73,7 @@ pub unsafe fn init() {
     scheduler.tasks.push(Task {
         saved_rsp: 0,
         _stack: None,
+        address_space: paging::kernel_address_space(),
     });
     scheduler.current = 0;
     scheduler.ticks_left = TIMESLICE_TICKS;
@@ -70,6 +87,15 @@ pub unsafe fn init() {
 /// spawn call in this kernel happens from `kernel_main` before any
 /// switch is possible, which satisfies that.
 pub fn spawn(entry: fn()) -> usize {
+    spawn_in(entry, paging::kernel_address_space())
+}
+
+/// Same as `spawn`, but the task runs in `address_space` instead of the
+/// kernel's own. `address_space` must already cover whatever `entry`
+/// touches before its first `yield_now`/preemption; see
+/// `paging::new_address_space` and its callers for how to build and
+/// populate one ahead of time.
+pub fn spawn_in(entry: fn(), address_space: AddressSpace) -> usize {
     let mut stack: Box<[u8]> = alloc::vec![0u8; STACK_SIZE].into_boxed_slice();
     let stack_top = stack.as_mut_ptr() as u64 + STACK_SIZE as u64;
     // Fabricate the initial saved-context frame by hand, matching what
@@ -119,6 +145,7 @@ pub fn spawn(entry: fn()) -> usize {
     scheduler.tasks.push(Task {
         saved_rsp: sp,
         _stack: Some(stack),
+        address_space,
     });
     scheduler.tasks.len() - 1
 }
@@ -139,7 +166,7 @@ pub fn spawn(entry: fn()) -> usize {
 /// an empty queue would panic and halt the whole machine over what's
 /// really just a boot-sequencing question, not a correctness one.
 pub fn tick() {
-    let (old_rsp_ptr, new_rsp) = {
+    let (old_rsp_ptr, new_rsp, next_as) = {
         let mut scheduler = SCHEDULER.lock();
         if scheduler.tasks.is_empty() {
             return;
@@ -160,14 +187,25 @@ pub fn tick() {
 
         let old_rsp_ptr = &mut scheduler.tasks[old_index].saved_rsp as *mut u64;
         let new_rsp = scheduler.tasks[next_index].saved_rsp;
-        (old_rsp_ptr, new_rsp)
+        let next_as = scheduler.tasks[next_index].address_space;
+        (old_rsp_ptr, new_rsp, next_as)
         // Lock guard drops here, before the switch; context_switch
         // never returns to this stack frame until this task is
         // rescheduled, so holding the lock across it would deadlock
         // every other task's tick()/yield_now() in the meantime.
     };
 
+    // Always reloads CR3, even when next_as is the same one already
+    // loaded (true for every task today, since nothing yet calls
+    // spawn_in with anything but the kernel's own AddressSpace).
+    // switch() already does an unconditional full TLB flush regardless
+    // of whether the PML4 actually changed, so skipping this on a
+    // same-AS switch would only save the mov-to-cr3 itself, not the
+    // flush; not worth the AddressSpace-equality check yet. Revisit if
+    // this ever shows up as a real cost once components actually run
+    // in separate spaces.
     unsafe {
+        next_as.switch();
         context_switch(old_rsp_ptr, new_rsp);
     }
     SWITCHES.fetch_add(1, Ordering::Relaxed);
@@ -191,7 +229,7 @@ pub fn yield_now() {
         core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
     }
 
-    let (old_rsp_ptr, new_rsp) = {
+    let (old_rsp_ptr, new_rsp, next_as) = {
         let mut scheduler = SCHEDULER.lock();
         let old_index = scheduler.current;
         let next_index = (old_index + 1) % scheduler.tasks.len();
@@ -207,10 +245,14 @@ pub fn yield_now() {
 
         let old_rsp_ptr = &mut scheduler.tasks[old_index].saved_rsp as *mut u64;
         let new_rsp = scheduler.tasks[next_index].saved_rsp;
-        (old_rsp_ptr, new_rsp)
+        let next_as = scheduler.tasks[next_index].address_space;
+        (old_rsp_ptr, new_rsp, next_as)
     };
 
+    // See the matching comment in tick(): always reloads CR3 for now,
+    // same-AS case not special-cased yet.
     unsafe {
+        next_as.switch();
         context_switch(old_rsp_ptr, new_rsp);
     }
     SWITCHES.fetch_add(1, Ordering::Relaxed);
