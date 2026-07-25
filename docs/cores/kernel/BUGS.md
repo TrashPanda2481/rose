@@ -54,3 +54,12 @@ Cause: `idt.rs` calls `scheduler::tick()` unconditionally on every timer IRQ, bu
 Fix: moved the `scheduler::init()` call to immediately before `pic::init()`, so task 0 is always registered before interrupts are ever enabled; removed the now-duplicate `init()` call from `scheduler_selftest()`. Also added a defensive `if tasks.is_empty() { return }` guard at the top of `tick()` itself, since this path is reachable from a real hardware interrupt whose timing this kernel doesn't control, not just from code that polls something on its own schedule.
 Confirmed fixed in Oracle VM VirtualBox: re-ran the fix, no panic, boot chain reaches `rose: scheduler self-test: task_a=10 task_b=10 switches=31` same as QEMU (real hardware ticks completed the 50-tick wait in 510ms).
 Commit/ref: kernel: scheduler (round-robin, context switching), boot-order fix
+
+## [FIXED] usermode self-test #PF copying the program into its own code page
+Date found: 2026-07-25
+Date fixed: 2026-07-25
+Symptom: first boot of the usermode self-test got as far as "rose: scheduler self-test" then paniced with `EXCEPTION vector=14 (page fault) error_code=0x3 rip=0xffffffff80005153 faulting address (cr2)=0x0000000000400000`, before ever reaching ring 3.
+Cause: the user code page was mapped R+X+U only (no WRITABLE), on the assumption that CPL0 writes bypass page permission checks the same way it bypasses the U/S check when SMAP/SMEP aren't enabled. That's true for U/S; it isn't true for the writable bit. CR0.WP still blocks a supervisor write to a page missing PAGE_WRITABLE regardless of ring. `usermode_selftest`'s own `copy_nonoverlapping` into that page (copying the hand-written program in) faulted immediately, error_code=0x3 decodes to present+write+supervisor, matching exactly.
+Fix: map the code page WRITABLE first, do the copy, then call `paging::map_page` again on the same virt+phys with WRITABLE dropped (R+X+U only) before ever entering ring 3. `map_page` just overwrites the leaf PTE, no unmap step needed between the two calls.
+Confirmed fixed in Oracle VM VirtualBox: re-ran the fix, same two-syscall sequence and final halt line as QEMU, no fault.
+Commit/ref: kernel: user mode (ring 3, syscall gate, usermode self-test)

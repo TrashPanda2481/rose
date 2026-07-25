@@ -34,6 +34,7 @@ use limine::memmap;
 use crate::mem::{FRAME_ALLOCATOR, FRAME_SIZE, SpinLock};
 
 pub const PAGE_WRITABLE: u64 = 1 << 1;
+pub const PAGE_USER: u64 = 1 << 2;
 pub const PAGE_NO_EXECUTE: u64 = 1 << 63;
 const PAGE_PRESENT: u64 = 1 << 0;
 const PAGE_HUGE: u64 = 1 << 7; // PS bit; only meaningful at the PD level here
@@ -95,16 +96,24 @@ fn index(virt: u64, level: u8) -> usize {
 
 /// Returns the physical address of the next-level table pointed to by the
 /// entry at `idx`, allocating and zeroing a fresh one if it isn't present
-/// yet. Intermediate levels are always PRESENT|WRITABLE; permissions are
-/// enforced at the leaf, not here, same convention the hardware itself is
-/// built around.
+/// yet. Intermediate levels are always PRESENT|WRITABLE|USER; permissions
+/// are enforced at the leaf, not here, same convention the hardware
+/// itself is built around. USER has to be set here too even though every
+/// caller so far has been kernel-only: x86 ANDs the U/S bit across every
+/// level of the walk, so a leaf PTE's own USER bit is meaningless if any
+/// PML4E/PDPTE/PDE above it lacks it. Harmless for existing kernel/HHDM
+/// branches, since this only fires the first time a given intermediate
+/// entry is allocated; access control still comes entirely from each
+/// leaf's own USER bit, this just stops it from being silently
+/// overridden by an intermediate table built before user mappings
+/// existed.
 unsafe fn next_level(table: &mut PageTable, idx: usize) -> u64 {
     let entry = table.0[idx];
     if entry & PAGE_PRESENT != 0 {
         entry & ADDR_MASK
     } else {
         let new_phys = alloc_zeroed_table();
-        table.0[idx] = new_phys | PAGE_PRESENT | PAGE_WRITABLE;
+        table.0[idx] = new_phys | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
         new_phys
     }
 }
