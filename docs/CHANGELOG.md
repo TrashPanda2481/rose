@@ -6,6 +6,7 @@ Format: date, what changed, why. Newest first.
 
 - Kernel boot verified in Oracle VM VirtualBox, matching QEMU serial output. Promoted `main` to `stable` (see `BRANCHING.md` merge log).
 - Memory bring-up: kernel parses Limine's memory map and logs every region over serial. Physical frame allocator built on top (free-list, HHDM-addressed, self-test on boot). Verified on QEMU BIOS+UEFI and Oracle VM VirtualBox. Promoted `main` to `stable` again (see `BRANCHING.md` merge log).
+- GDT/IDT and kernel-owned page tables added (all 32 exception vectors, double-fault IST stack, W^X kernel image mapping, HHDM remap, map/unmap self-tests). Verified on QEMU BIOS+UEFI only so far; VirtualBox verification deliberately deferred, both still on `main` only, not yet in `stable`.
 
 ## 2026-07-19
 

@@ -4,6 +4,7 @@
 mod gdt;
 mod idt;
 mod mem;
+mod paging;
 mod serial;
 
 use core::fmt::Write;
@@ -12,6 +13,7 @@ use limine::BaseRevision;
 use limine::RequestsEndMarker;
 use limine::RequestsStartMarker;
 use limine::memmap;
+use limine::request::ExecutableAddressRequest;
 use limine::request::HhdmRequest;
 use limine::request::MemmapRequest;
 
@@ -26,6 +28,11 @@ static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
 #[used]
 #[unsafe(link_section = ".requests")]
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+
+#[used]
+#[unsafe(link_section = ".requests")]
+pub(crate) static EXECUTABLE_ADDRESS_REQUEST: ExecutableAddressRequest =
+    ExecutableAddressRequest::new();
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -87,6 +94,13 @@ unsafe extern "C" fn kernel_main() -> ! {
 
     idt_selftest(&mut com1);
 
+    unsafe {
+        paging::init(hhdm_offset, entries);
+    }
+    let _ = writeln!(com1, "rose: page tables loaded, kernel-owned");
+
+    paging_selftest(&mut com1);
+
     loop {
         core::arch::asm!("hlt");
     }
@@ -102,6 +116,44 @@ fn idt_selftest(com1: &mut serial::Serial) {
         core::arch::asm!("int3");
     }
     let _ = writeln!(com1, "rose: idt self-test: resumed after breakpoint, ok");
+}
+
+/// Allocates a frame, maps it at a throwaway virtual address, writes a
+/// pattern through the new mapping, reads it back, unmaps, and confirms
+/// the frame goes back to the allocator cleanly. Proves map_page/unmap_page
+/// work on the kernel's own tables, not just that the CR3 switch succeeded
+/// without immediately faulting.
+fn paging_selftest(com1: &mut serial::Serial) {
+    const TEST_VIRT: u64 = 0xffff_a000_0000_0000;
+    const PATTERN: u64 = 0xdead_beef_cafe_f00d;
+
+    let phys = mem::FRAME_ALLOCATOR
+        .lock()
+        .alloc()
+        .expect("rose: paging self-test: out of memory");
+
+    unsafe {
+        paging::map_page(TEST_VIRT, phys, paging::PAGE_WRITABLE | paging::PAGE_NO_EXECUTE);
+    }
+
+    let ptr = TEST_VIRT as *mut u64;
+    unsafe {
+        ptr.write_volatile(PATTERN);
+    }
+    let readback = unsafe { ptr.read_volatile() };
+    let _ = writeln!(
+        com1,
+        "rose: paging self-test: wrote {:#018x}, read {:#018x}, {}",
+        PATTERN,
+        readback,
+        if readback == PATTERN { "match" } else { "MISMATCH" }
+    );
+
+    unsafe {
+        paging::unmap_page(TEST_VIRT);
+        mem::FRAME_ALLOCATOR.lock().free(phys);
+    }
+    let _ = writeln!(com1, "rose: paging self-test: unmapped, frame returned to allocator");
 }
 
 fn frame_allocator_selftest(com1: &mut serial::Serial) {

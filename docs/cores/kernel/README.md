@@ -1,6 +1,6 @@
 # Kernel core
 
-Status: boots. Entry point + serial output working on BIOS and UEFI in QEMU, and verified in Oracle VM VirtualBox. Limine's memory map is parsed and logged (base/length/type per region, usable total). Physical frame allocator is in (`kernel/src/mem.rs`), free-list based, addressed via HHDM, verified with a self-test on boot. Our own GDT/IDT/TSS are loaded (`kernel/src/gdt.rs`, `kernel/src/idt.rs`), all 32 CPU exception vectors handled, double fault backed by an IST stack, verified with a breakpoint self-test on boot plus manual #GP/#PF fault injection during development. Capabilities/IPC/scheduler below are still spec only, not implemented.
+Status: boots. Entry point + serial output working on BIOS and UEFI in QEMU, and verified in Oracle VM VirtualBox. Limine's memory map is parsed and logged (base/length/type per region, usable total). Physical frame allocator is in (`kernel/src/mem.rs`), free-list based, addressed via HHDM, verified with a self-test on boot. Our own GDT/IDT/TSS are loaded (`kernel/src/gdt.rs`, `kernel/src/idt.rs`), all 32 CPU exception vectors handled, double fault backed by an IST stack, verified with a breakpoint self-test on boot plus manual #GP/#PF fault injection during development. Kernel now owns its own page tables (`kernel/src/paging.rs`): kernel image mapped section-by-section with W^X (text R+X, rodata R-only, data/bss R+W+NX), HHDM remapped for usable and bootloader-reclaimable memory, verified with a map/write/read/unmap self-test on boot. GDT/IDT/page tables verified in BIOS+UEFI QEMU only so far; VirtualBox verification still pending for all three, deferred by choice, see BRANCHING.md. Capabilities/IPC/scheduler below are still spec only, not implemented.
 
 ## Boot, concretely
 
@@ -94,13 +94,15 @@ No global address, no global path. Sharing between components only happens if on
 ## Boot handoff
 
 1. Bootloader (Limine) hands kernel a memory map, framebuffer, entry point.
-2. Kernel sets up its own state: frame allocator, page tables, IDT/GDT, timer.
+2. Kernel sets up its own state: frame allocator, GDT/IDT, page tables, timer.
 3. Kernel creates the root task, first and only privileged component, and gives it:
    - Untyped caps covering all remaining physical memory
    - Caps to its own AddressSpace, Thread, CSpace
    - Cap to the boot console/serial device
    - A BootInfo page (plain data, not a cap): memory map, framebuffer geometry
 4. Kernel starts the root task's thread. Kernel never creates another component after this; root task does it by retyping Untyped memory.
+
+Actual v0.1 order in step 2 is GDT/IDT before page tables, not the reverse: neither GDT/IDT nor their self-tests touch anything beyond static kernel data that's already mapped by Limine's own tables, so there's no reason to gate them on the kernel owning its own hierarchy first. Page tables come right after because everything past this point (a heap, per-component AddressSpace objects, user mode) needs the kernel to own its mappings outright rather than borrowing the bootloader's indefinitely.
 
 This is the only place authority comes from nothing. Every other capability in the system traces back to this handoff. If it doesn't trace back, something's wrong.
 
