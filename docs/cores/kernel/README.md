@@ -1,6 +1,6 @@
 # Kernel core
 
-Status: boots. Entry point + serial output working on BIOS and UEFI in QEMU, and verified in Oracle VM VirtualBox. Capabilities/IPC/scheduler below are still spec only, not implemented.
+Status: boots. Entry point + serial output working on BIOS and UEFI in QEMU, and verified in Oracle VM VirtualBox. Limine's memory map is now parsed and logged (base/length/type per region, usable total). No frame allocator yet. Capabilities/IPC/scheduler below are still spec only, not implemented.
 
 ## Boot, concretely
 
