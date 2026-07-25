@@ -8,6 +8,9 @@
 // a not-present gate turns it into a #GP, which we do handle, so it still
 // gets logged instead of vanishing into an undefined CPU state.
 //
+// Vector 32's dispatch also drives the scheduler (scheduler::tick()),
+// since a timeslice expiring is itself just a timer tick.
+//
 // Every stub is hand-written asm, not the unstable `x86-interrupt` Rust
 // ABI. Slightly more code, but the stack layout is fully ours to see and
 // name, nothing about it depends on how a future compiler happens to
@@ -25,6 +28,7 @@ use core::fmt::Write;
 use crate::gdt::{DOUBLE_FAULT_IST_INDEX, KERNEL_CODE_SELECTOR};
 use crate::mem::SpinLock;
 use crate::pic;
+use crate::scheduler;
 use crate::serial;
 use crate::timer;
 
@@ -164,8 +168,19 @@ extern "C" fn rose_exception_handler(frame: *mut InterruptFrame) {
     if vector == pic::IRQ0_TIMER_VECTOR {
         // Not an exception; a hardware tick. No logging on the hot path,
         // every serial write here would mean 100 lines/sec forever.
-        timer::on_tick();
+        //
+        // EOI has to go out before anything else runs, not after:
+        // scheduler::tick() can context-switch away, and this exact call
+        // frame then doesn't "return" (doesn't continue past this point)
+        // until this task is rescheduled, possibly many ticks later. If
+        // EOI hadn't been sent yet, the PIC's IRQ0 in-service bit would
+        // stay set that whole time, blocking every further IRQ0; that
+        // would mean no more ticks ever fire, so this task would never
+        // get rescheduled either. EOI is unconditional and immediate,
+        // decoupled from whatever the handler body does afterward.
         unsafe { pic::send_eoi(0) };
+        timer::on_tick();
+        scheduler::tick();
         return;
     }
 

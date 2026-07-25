@@ -10,6 +10,7 @@ mod idt;
 mod mem;
 mod paging;
 mod pic;
+mod scheduler;
 mod serial;
 mod timer;
 
@@ -17,6 +18,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicU64, Ordering};
 use limine::BaseRevision;
 use limine::RequestsEndMarker;
 use limine::RequestsStartMarker;
@@ -127,6 +129,8 @@ unsafe extern "C" fn kernel_main() -> ! {
     let _ = writeln!(com1, "rose: timer programmed at 100hz, interrupts enabled");
 
     timer_selftest(&mut com1);
+
+    scheduler_selftest(&mut com1);
 
     loop {
         core::arch::asm!("hlt");
@@ -284,6 +288,71 @@ fn timer_selftest(com1: &mut serial::Serial) {
             timer::ticks()
         );
     }
+}
+
+static TASK_A_COUNT: AtomicU64 = AtomicU64::new(0);
+static TASK_B_COUNT: AtomicU64 = AtomicU64::new(0);
+static TASKS_DONE: AtomicU64 = AtomicU64::new(0);
+
+// Round-robin never skips a task that stops yielding; it just always
+// advances to (current+1) % len, whether or not that task ever calls
+// yield_now again. So after signaling done, these keep yielding forever
+// instead of parking in a spin loop; parking here would freeze every
+// other ring member, including task 0's own wait loop below, since
+// nothing would ever rotate control past a task stuck outside
+// yield_now. See BUGS.md, "scheduler self-test hangs after first task
+// finishes".
+fn task_a() {
+    for _ in 0..10u64 {
+        TASK_A_COUNT.fetch_add(1, Ordering::Relaxed);
+        scheduler::yield_now();
+    }
+    TASKS_DONE.fetch_add(1, Ordering::Relaxed);
+    loop {
+        scheduler::yield_now();
+    }
+}
+
+fn task_b() {
+    for _ in 0..10u64 {
+        TASK_B_COUNT.fetch_add(1, Ordering::Relaxed);
+        scheduler::yield_now();
+    }
+    TASKS_DONE.fetch_add(1, Ordering::Relaxed);
+    loop {
+        scheduler::yield_now();
+    }
+}
+
+/// Spawns two tasks that each count to 10 and voluntarily yield in
+/// between, then cooperatively yields itself (task 0) until both are
+/// done. Fully deterministic round-robin ping-pong (task0 -> task_a ->
+/// task_b -> task0 -> ...) regardless of whether hardware timer
+/// interrupts fire at all, since it's entirely voluntary. Real hardware
+/// ticks, where they land (confirmed working in VirtualBox, not in this
+/// sandbox's QEMU/TCG, see TROUBLESHOOTING.md), interleave harmlessly
+/// through the same round-robin rule tick() and yield_now() share, no
+/// special-casing needed. This is the portable proof point; hardware
+/// preemption itself is only visible opportunistically via switches()
+/// counting higher than the 20 voluntary yields below would alone.
+fn scheduler_selftest(com1: &mut serial::Serial) {
+    unsafe {
+        scheduler::init();
+    }
+    scheduler::spawn(task_a);
+    scheduler::spawn(task_b);
+
+    while TASKS_DONE.load(Ordering::Relaxed) < 2 {
+        scheduler::yield_now();
+    }
+
+    let _ = writeln!(
+        com1,
+        "rose: scheduler self-test: task_a={} task_b={} switches={}",
+        TASK_A_COUNT.load(Ordering::Relaxed),
+        TASK_B_COUNT.load(Ordering::Relaxed),
+        scheduler::switches()
+    );
 }
 
 fn frame_allocator_selftest(com1: &mut serial::Serial) {
