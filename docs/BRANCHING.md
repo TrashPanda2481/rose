@@ -17,6 +17,7 @@ Track every main → stable merge here. Newest first.
 ```
 Date        Commit      What it proves works
 ----        ------      ---------------------
+2026-07-25  29207ce     Memory map parsing + physical frame allocator, verified on QEMU (BIOS+UEFI) and Oracle VM VirtualBox.
 2026-07-25  9235f89     Kernel boots and reaches the smoke-test serial output on both QEMU (BIOS+UEFI) and Oracle VM VirtualBox.
 ```
 
