@@ -234,18 +234,26 @@ fn rdtsc() -> u64 {
 /// Waits for 50 ticks (0.5s at 100Hz) to go by, proving PIC remap + IDT
 /// vector 32 dispatch + PIT programming all work end to end via a real
 /// hardware interrupt. Bounded by an RDTSC-measured ~2 real seconds
-/// (assuming a conservative >=500MHz floor, no calibration needed for a
-/// coarse timeout) rather than waiting unboundedly: some environments
-/// (this project's QEMU sandbox, see BUGS.md) never deliver
-/// IRQ0 to the CPU despite correct PIC/PIT programming, so an unbounded
-/// wait here would hang boot forever. If the timeout is hit, falls back
-/// to a software-triggered `int 0x20` to at least confirm the IDT
-/// dispatch, PIC EOI, and tick-counting path are wired correctly, which
-/// is everything except the actual hardware delivery.
+/// rather than waiting unboundedly: this project's QEMU/TCG sandbox (see
+/// BUGS.md) never delivers IRQ0 to the CPU despite correct
+/// PIC/PIT programming, so an unbounded wait here would hang boot
+/// forever there. If the timeout is hit, falls back to a
+/// software-triggered `int 0x20` to at least confirm the IDT dispatch,
+/// PIC EOI, and tick-counting path are wired correctly, which is
+/// everything except the actual hardware delivery.
+///
+/// The cycle budget below uses an assumed CEILING on host TSC frequency,
+/// not a floor: cycle_budget / actual_hz only comes out to >= WAIT_SECONDS
+/// if actual_hz <= the assumed value. An earlier version of this used a
+/// 500MHz floor here, which on a real multi-GHz host made the whole wait
+/// bail out after a few hundred ms instead of the intended 2s, so a
+/// working hardware timer (confirmed via a VirtualBox boot where the
+/// tick counter visibly advanced) still got reported as "no hardware
+/// irq0" because the test gave up too early. See BUGS.md.
 fn timer_selftest(com1: &mut serial::Serial) {
-    const MIN_ASSUMED_HZ: u64 = 500_000_000;
+    const MAX_ASSUMED_HZ: u64 = 8_000_000_000;
     const WAIT_SECONDS: u64 = 2;
-    let cycle_budget = MIN_ASSUMED_HZ * WAIT_SECONDS;
+    let cycle_budget = MAX_ASSUMED_HZ * WAIT_SECONDS;
 
     let start_ticks = timer::ticks();
     let target_ticks = start_ticks + 50;
