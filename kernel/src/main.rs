@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod mem;
 mod serial;
 
 use core::fmt::Write;
@@ -9,6 +10,7 @@ use limine::BaseRevision;
 use limine::RequestsEndMarker;
 use limine::RequestsStartMarker;
 use limine::memmap;
+use limine::request::HhdmRequest;
 use limine::request::MemmapRequest;
 
 #[used]
@@ -18,6 +20,10 @@ static BASE_REVISION: BaseRevision = BaseRevision::new();
 #[used]
 #[unsafe(link_section = ".requests")]
 static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
+
+#[used]
+#[unsafe(link_section = ".requests")]
+static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -59,9 +65,54 @@ unsafe extern "C" fn kernel_main() -> ! {
     }
     let _ = writeln!(com1, "rose: usable memory: {} KiB", usable_bytes / 1024);
 
+    let hhdm_response = HHDM_REQUEST
+        .response()
+        .expect("rose: bootloader gave no HHDM offset");
+    let hhdm_offset = hhdm_response.offset;
+    let _ = writeln!(com1, "rose: hhdm offset={:#018x}", hhdm_offset);
+
+    unsafe {
+        mem::init(hhdm_offset, entries);
+    }
+
+    frame_allocator_selftest(&mut com1);
+
     loop {
         core::arch::asm!("hlt");
     }
+}
+
+fn frame_allocator_selftest(com1: &mut serial::Serial) {
+    let mut allocator = mem::FRAME_ALLOCATOR.lock();
+    let _ = writeln!(
+        com1,
+        "rose: frame allocator: {} total frames, {} free",
+        allocator.total_count(),
+        allocator.free_count()
+    );
+
+    let a = allocator.alloc();
+    let b = allocator.alloc();
+    let c = allocator.alloc();
+    let _ = writeln!(com1, "rose: alloc test: got {:?} {:?} {:?}", a, b, c);
+
+    if let Some(phys) = b {
+        unsafe {
+            allocator.free(phys);
+        }
+    }
+    let d = allocator.alloc();
+    let _ = writeln!(
+        com1,
+        "rose: alloc after free: got {:?}, expected same as freed frame",
+        d
+    );
+
+    let _ = writeln!(
+        com1,
+        "rose: frame allocator: {} free after self-test",
+        allocator.free_count()
+    );
 }
 
 /// Human-readable label for a Limine memmap entry type. Serial-log only for
