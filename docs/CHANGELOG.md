@@ -5,6 +5,7 @@ Format: date, what changed, why. Newest first.
 ## 2026-07-25
 
 - Kernel boot verified in Oracle VM VirtualBox, matching QEMU serial output. Promoted `main` to `stable` (see `BRANCHING.md` merge log).
+- Memory bring-up: kernel parses Limine's memory map and logs every region over serial. Physical frame allocator built on top (free-list, HHDM-addressed, self-test on boot). Verified on QEMU BIOS+UEFI and Oracle VM VirtualBox. Promoted `main` to `stable` again (see `BRANCHING.md` merge log).
 
 ## 2026-07-19
 

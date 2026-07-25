@@ -9,6 +9,7 @@ Date, change, why. Newest first.
 - Promoted to `stable`.
 - Memory bring-up started: kernel now requests and parses Limine's memory map (`MemmapRequest`), logs every region's base/length/type over serial, and totals usable memory. Verified on both BIOS and UEFI. First step toward the physical frame allocator; no allocator yet, this is just reading and printing what the bootloader reports.
 - Physical frame allocator (`kernel/src/mem.rs`): free-list over 4KiB frames built from the usable memory map regions, addressed through the HHDM offset (`HhdmRequest`) rather than assuming identity mapping. Free frames store the next-free pointer in their own first 8 bytes, so no separate bookkeeping array. Wrapped in a small spinlock (`SpinLock`, hand-rolled, not the `spin` crate) since nothing runs concurrently yet but it costs nothing to add now. Self-test on boot allocates three frames, frees the middle one, allocates again, confirms it gets the freed frame back. Verified on both BIOS and UEFI: 65186 free frames (256MiB QEMU BIOS run), 53896 free frames (UEFI run, less usable RAM due to firmware reservations). Bootloader-reclaimable regions are deliberately left out of the free list for now; reclaiming them safely needs to happen after every Limine response has been read, which isn't tracked yet.
+- Memory map parsing and frame allocator verified in Oracle VM VirtualBox: 17 regions, 16043 usable frames, self-test passed with the same freed-frame-comes-back-first behavior seen in QEMU. Promoted to `stable`.
 
 ## 2026-07-19
 
