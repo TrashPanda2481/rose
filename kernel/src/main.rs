@@ -1,12 +1,18 @@
 #![no_std]
 #![no_main]
+#![feature(alloc_error_handler)]
+
+extern crate alloc;
 
 mod gdt;
+mod heap;
 mod idt;
 mod mem;
 mod paging;
 mod serial;
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::fmt::Write;
 use core::panic::PanicInfo;
 use limine::BaseRevision;
@@ -101,6 +107,13 @@ unsafe extern "C" fn kernel_main() -> ! {
 
     paging_selftest(&mut com1);
 
+    unsafe {
+        heap::init();
+    }
+    let _ = writeln!(com1, "rose: heap loaded, {} bytes free", heap::free_bytes());
+
+    heap_selftest(&mut com1);
+
     loop {
         core::arch::asm!("hlt");
     }
@@ -154,6 +167,45 @@ fn paging_selftest(com1: &mut serial::Serial) {
         mem::FRAME_ALLOCATOR.lock().free(phys);
     }
     let _ = writeln!(com1, "rose: paging self-test: unmapped, frame returned to allocator");
+}
+
+/// Exercises the heap through the actual `alloc` crate types it exists to
+/// support, not just the raw GlobalAlloc entry points: a Box (single fixed
+/// allocation) and a Vec that's pushed past its initial capacity (forces
+/// at least one grow, which is alloc+copy+dealloc under the hood via
+/// GlobalAlloc's default `realloc`). Everything goes out of scope at the
+/// end of this function, so the free-byte count logged after should match
+/// the one logged right after heap::init().
+fn heap_selftest(com1: &mut serial::Serial) {
+    let boxed = Box::new(0xdead_beef_u64);
+    let _ = writeln!(com1, "rose: heap self-test: boxed value = {:#x}", *boxed);
+
+    let mut v: Vec<u64> = Vec::new();
+    for i in 0..64u64 {
+        v.push(i * i);
+    }
+    let sum: u64 = v.iter().sum();
+    let _ = writeln!(
+        com1,
+        "rose: heap self-test: vec len={} sum={}",
+        v.len(),
+        sum
+    );
+    let _ = writeln!(
+        com1,
+        "rose: heap self-test: {} bytes allocated, {} bytes free",
+        heap::allocated_bytes(),
+        heap::free_bytes()
+    );
+
+    drop(boxed);
+    drop(v);
+    let _ = writeln!(
+        com1,
+        "rose: heap self-test: after drop, {} bytes allocated, {} bytes free",
+        heap::allocated_bytes(),
+        heap::free_bytes()
+    );
 }
 
 fn frame_allocator_selftest(com1: &mut serial::Serial) {
