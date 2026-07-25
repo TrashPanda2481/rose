@@ -31,6 +31,12 @@ use crate::pic;
 use crate::scheduler;
 use crate::serial;
 use crate::timer;
+use crate::usermode;
+
+/// Software interrupt vector ring 3 code uses to call into the kernel.
+/// Arbitrary choice within the unused 33-255 range, 0x80 just matches
+/// the long-standing convention from other syscall-via-int designs.
+pub const SYSCALL_VECTOR: u8 = 0x80;
 
 #[repr(C)]
 struct SavedRegs {
@@ -101,6 +107,21 @@ impl Entry {
         // are written to tolerate a nested interrupt firing mid-handler.
         self.type_attr = 0x8E;
     }
+
+    /// Same as `set`, except DPL=11 instead of DPL=00. Used only for the
+    /// syscall gate: a ring-3 `int 0x80` against a DPL=00 gate would take
+    /// a #GP instead of entering the handler, since the CPU checks the
+    /// gate's DPL against CPL for a software `int` (not for a hardware
+    /// IRQ or CPU exception, which is why every other gate stays DPL=00).
+    fn set_user(&mut self, handler: u64, ist_index: u8) {
+        self.offset_low = handler as u16;
+        self.offset_mid = (handler >> 16) as u16;
+        self.offset_high = (handler >> 32) as u32;
+        self.selector = KERNEL_CODE_SELECTOR;
+        self.ist_and_reserved = ist_index & 0x7;
+        // Present=1, DPL=11, 64-bit interrupt gate (0xE).
+        self.type_attr = 0xEE;
+    }
 }
 
 static IDT: SpinLock<[Entry; 256]> = SpinLock::new([Entry::missing(); 256]);
@@ -164,6 +185,16 @@ fn read_cr2() -> u64 {
 extern "C" fn rose_exception_handler(frame: *mut InterruptFrame) {
     let frame = unsafe { &*frame };
     let vector = frame.vector;
+
+    if vector == SYSCALL_VECTOR as u64 {
+        // Software syscall, not a hardware tick or a fault. Same
+        // reasoning as the IRQ0 branch just below for why this is
+        // special-cased ahead of the generic exception-logging path:
+        // this is an expected, frequent, non-error control transfer,
+        // not something to run through the fatal-by-default handler.
+        usermode::on_syscall(frame.regs.rax);
+        return;
+    }
 
     if vector == pic::IRQ0_TIMER_VECTOR {
         // Not an exception; a hardware tick. No logging on the hot path,
@@ -314,6 +345,9 @@ define_stub!(stub_29, 29, has_error_code);
 define_stub!(stub_30, 30, has_error_code);
 define_stub!(stub_31, 31, no_error_code);
 define_stub!(stub_32, 32, no_error_code);
+// Software `int 0x80` pushes no CPU error code, same as any other
+// software-invoked interrupt gate.
+define_stub!(stub_128, 128, no_error_code);
 
 /// Loads the IDT. Safety: caller must call this exactly once, after
 /// `gdt::init`, since gates reference `KERNEL_CODE_SELECTOR` and the
@@ -353,6 +387,7 @@ pub unsafe fn init() {
     idt[30].set(stub_30 as *const () as u64, 0);
     idt[31].set(stub_31 as *const () as u64, 0);
     idt[32].set(stub_32 as *const () as u64, 0);
+    idt[128].set_user(stub_128 as *const () as u64, 0);
 
     let pointer = DescriptorTablePointer {
         limit: (core::mem::size_of::<[Entry; 256]>() - 1) as u16,

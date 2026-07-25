@@ -13,6 +13,7 @@ mod pic;
 mod scheduler;
 mod serial;
 mod timer;
+mod usermode;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -143,9 +144,7 @@ unsafe extern "C" fn kernel_main() -> ! {
 
     scheduler_selftest(&mut com1);
 
-    loop {
-        core::arch::asm!("hlt");
-    }
+    usermode_selftest(&mut com1)
 }
 
 /// Deliberately triggers a breakpoint exception. If GDT/IDT/TSS are wired
@@ -316,6 +315,83 @@ fn timer_selftest(com1: &mut serial::Serial) {
             timer::ticks()
         );
     }
+}
+
+// TSS.rsp0 target: the stack the CPU auto-loads on the user self-test's
+// ring3->ring0 syscall trap. Same pattern as gdt.rs's own
+// DOUBLE_FAULT_STACK, a separate static rather than reusing whatever
+// stack kernel_main happens to be running on, since that one is still
+// in use by the very call frame that's about to go one-way into ring 3.
+const KERNEL_SCRATCH_STACK_SIZE: usize = 4096 * 4;
+static mut KERNEL_SCRATCH_STACK: [u8; KERNEL_SCRATCH_STACK_SIZE] = [0; KERNEL_SCRATCH_STACK_SIZE];
+
+/// Maps a code page and a stack page as USER, copies the hand-written
+/// asm program from usermode.rs into the code page, points TSS.rsp0 at
+/// a kernel scratch stack, then drops to ring 3. Never returns:
+/// enter_user_mode is one-way in this v0.1 cut, and on_syscall's second
+/// call is what actually halts the CPU for good. See usermode.rs module
+/// docs. This is why it's the last thing kernel_main calls, and why the
+/// old trailing `loop { hlt }` that used to sit here is gone, it would
+/// have been unreachable code once this diverges instead.
+fn usermode_selftest(com1: &mut serial::Serial) -> ! {
+    // Both arbitrary, page-aligned, and far below the kernel's
+    // higher-half virtual range and the HHDM range alike, guaranteeing
+    // a fresh PML4 branch (see paging.rs's next_level PAGE_USER fix;
+    // nothing already mapped up here could collide).
+    const CODE_VADDR: u64 = 0x0000_0000_0040_0000;
+    const STACK_VADDR: u64 = 0x0000_0000_0060_0000;
+
+    let code_phys = mem::FRAME_ALLOCATOR
+        .lock()
+        .alloc()
+        .expect("rose: usermode self-test: out of memory (code)");
+    unsafe {
+        // Mapped WRITABLE for the copy below, then re-mapped R+X only
+        // (no WRITABLE) right after. CPL0 ignores the U/S bit absent
+        // SMAP/SMEP, but that's not the same thing as CR0.WP: a
+        // supervisor write to a page missing the WRITABLE bit still
+        // faults. First attempt at this left WRITABLE out from the
+        // start, kernel's own copy_nonoverlapping into it #PF'd
+        // immediately (error_code=0x3, W=1 U=0); see BUGS.md.
+        paging::map_page(CODE_VADDR, code_phys, paging::PAGE_USER | paging::PAGE_WRITABLE);
+    }
+    let program = usermode::program_bytes();
+    unsafe {
+        core::ptr::copy_nonoverlapping(program.as_ptr(), CODE_VADDR as *mut u8, program.len());
+    }
+    unsafe {
+        // Re-map same virt+phys, WRITABLE dropped: map_page just
+        // overwrites the leaf PTE, no unmap needed first. Restores
+        // W^X (R+X+U only) before this page ever runs in ring 3.
+        paging::map_page(CODE_VADDR, code_phys, paging::PAGE_USER);
+    }
+
+    let stack_phys = mem::FRAME_ALLOCATOR
+        .lock()
+        .alloc()
+        .expect("rose: usermode self-test: out of memory (stack)");
+    unsafe {
+        paging::map_page(
+            STACK_VADDR,
+            stack_phys,
+            paging::PAGE_USER | paging::PAGE_WRITABLE | paging::PAGE_NO_EXECUTE,
+        );
+    }
+    let user_stack_top = STACK_VADDR + mem::FRAME_SIZE;
+
+    unsafe {
+        let scratch_top =
+            core::ptr::addr_of!(KERNEL_SCRATCH_STACK) as u64 + KERNEL_SCRATCH_STACK_SIZE as u64;
+        gdt::set_kernel_stack(scratch_top);
+    }
+
+    let _ = writeln!(
+        com1,
+        "rose: usermode self-test: entering ring 3 at {:#018x}, stack top {:#018x}",
+        CODE_VADDR, user_stack_top
+    );
+
+    unsafe { usermode::enter_user_mode(CODE_VADDR, user_stack_top) }
 }
 
 static TASK_A_COUNT: AtomicU64 = AtomicU64::new(0);

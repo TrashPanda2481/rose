@@ -18,6 +18,12 @@ use core::mem::size_of;
 pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
 pub const KERNEL_DATA_SELECTOR: u16 = 0x10;
 pub const TSS_SELECTOR: u16 = 0x18;
+// RPL=3 baked directly into the selector value. Every place that loads
+// one of these (iretq frame, segment registers after a ring3 entry)
+// wants it there anyway, so it isn't left as a separate detail callers
+// have to remember to OR in themselves.
+pub const USER_CODE_SELECTOR: u16 = 0x28 | 3;
+pub const USER_DATA_SELECTOR: u16 = 0x30 | 3;
 
 /// IDT `ist` field value that routes double faults through TSS.ist[0]
 /// (IST1). 0 means "use whatever stack was already active."
@@ -75,6 +81,11 @@ const CODE_FLAGS: u8 = 0b1010;
 const DATA_FLAGS: u8 = 0b1000;
 // TSS access byte: P=1, DPL=00, Type=1001 (64-bit TSS, available).
 const TSS_ACCESS: u8 = 0x89;
+// Same as CODE_ACCESS/DATA_ACCESS but DPL=11: what makes these
+// selectors loadable from ring 3 at all. Without DPL=3 here, a `mov`
+// or `iretq` into either one would #GP the instant it hit ring 3.
+const USER_CODE_ACCESS: u8 = 0xFA;
+const USER_DATA_ACCESS: u8 = 0xF2;
 
 /// TSS descriptor is a 16-byte "system segment" (needs the full 64-bit
 /// base), unlike the plain 8-byte code/data descriptors above. Built from
@@ -90,12 +101,14 @@ fn tss_descriptor(base: u64, limit: u32) -> [u64; 2] {
     [low, high]
 }
 
-static mut GDT: [u64; 5] = [
+static mut GDT: [u64; 7] = [
     0,                                          // 0x00: null descriptor, required
     code_data_descriptor(CODE_ACCESS, CODE_FLAGS), // 0x08: kernel code
     code_data_descriptor(DATA_ACCESS, DATA_FLAGS), // 0x10: kernel data
     0,                                          // 0x18: TSS descriptor low, filled at init
     0,                                          // TSS descriptor high, filled at init
+    code_data_descriptor(USER_CODE_ACCESS, CODE_FLAGS), // 0x28: user code
+    code_data_descriptor(USER_DATA_ACCESS, DATA_FLAGS), // 0x30: user data
 ];
 
 #[repr(C, packed)]
@@ -120,7 +133,7 @@ pub unsafe fn init() {
     GDT[4] = tss_desc[1];
 
     let pointer = DescriptorTablePointer {
-        limit: (size_of::<[u64; 5]>() - 1) as u16,
+        limit: (size_of::<[u64; 7]>() - 1) as u16,
         base: core::ptr::addr_of!(GDT) as u64,
     };
     asm!("lgdt [{}]", in(reg) &pointer, options(readonly));
@@ -151,4 +164,17 @@ pub unsafe fn init() {
     );
 
     asm!("ltr {sel:x}", sel = in(reg) TSS_SELECTOR, options(nostack, preserves_flags));
+}
+
+/// Sets TSS.rsp0, the stack the CPU auto-loads on any ring3->ring0
+/// privilege-changing interrupt/exception (any IDT gate with ist=0,
+/// which is every gate except the double-fault one). Has to point at a
+/// valid kernel stack before the first such transition ever happens, or
+/// the CPU faults trying to load garbage into rsp on the way in.
+///
+/// Safety: caller must ensure `rsp0` is the top of a real, currently
+/// unused kernel stack that stays valid for as long as ring 3 code might
+/// trap back in.
+pub unsafe fn set_kernel_stack(rsp0: u64) {
+    TSS.rsp[0] = rsp0;
 }
