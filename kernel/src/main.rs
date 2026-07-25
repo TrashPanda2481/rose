@@ -112,6 +112,8 @@ unsafe extern "C" fn kernel_main() -> ! {
 
     paging_selftest(&mut com1);
 
+    address_space_selftest(&mut com1);
+
     unsafe {
         heap::init();
     }
@@ -168,13 +170,14 @@ fn paging_selftest(com1: &mut serial::Serial) {
     const TEST_VIRT: u64 = 0xffff_a000_0000_0000;
     const PATTERN: u64 = 0xdead_beef_cafe_f00d;
 
+    let kernel_as = paging::kernel_address_space();
     let phys = mem::FRAME_ALLOCATOR
         .lock()
         .alloc()
         .expect("rose: paging self-test: out of memory");
 
     unsafe {
-        paging::map_page(TEST_VIRT, phys, paging::PAGE_WRITABLE | paging::PAGE_NO_EXECUTE);
+        kernel_as.map_page(TEST_VIRT, phys, paging::PAGE_WRITABLE | paging::PAGE_NO_EXECUTE);
     }
 
     let ptr = TEST_VIRT as *mut u64;
@@ -191,10 +194,75 @@ fn paging_selftest(com1: &mut serial::Serial) {
     );
 
     unsafe {
-        paging::unmap_page(TEST_VIRT);
+        kernel_as.unmap_page(TEST_VIRT);
         mem::FRAME_ALLOCATOR.lock().free(phys);
     }
     let _ = writeln!(com1, "rose: paging self-test: unmapped, frame returned to allocator");
+}
+
+/// Builds a second address space alongside the kernel's own, proves the
+/// kernel side can't see a page mapped only in the new one and vice
+/// versa (via `is_mapped`, a read-only walk, so proving "not mapped"
+/// never risks a self-inflicted page fault from touching the address
+/// directly), switches CR3 into it, writes and reads back a pattern
+/// through the now-valid virtual pointer, then switches back to the
+/// kernel. First reversible address-space switch in the project, done
+/// entirely in ring 0 so it's safe either direction. No explicit
+/// initial switch back to the kernel address space is needed going in,
+/// since `paging::init()` already put it there at boot.
+fn address_space_selftest(com1: &mut serial::Serial) {
+    // Distinct from usermode.rs's 0x400000/0x600000 on purpose, though a
+    // collision would be harmless anyway: different PML4 roots mean the
+    // same virtual address in two AddressSpaces maps to two entirely
+    // separate leaf PTEs.
+    const TEST_VIRT: u64 = 0x0000_0000_0020_0000;
+    const PATTERN: u64 = 0xfeed_face_1234_5678;
+
+    let kernel_as = paging::kernel_address_space();
+    let user_as = unsafe { paging::new_address_space() };
+
+    let phys = mem::FRAME_ALLOCATOR
+        .lock()
+        .alloc()
+        .expect("rose: address space self-test: out of memory");
+    unsafe {
+        user_as.map_page(TEST_VIRT, phys, paging::PAGE_WRITABLE | paging::PAGE_NO_EXECUTE);
+    }
+
+    let isolated = unsafe { !kernel_as.is_mapped(TEST_VIRT) && user_as.is_mapped(TEST_VIRT) };
+    let _ = writeln!(
+        com1,
+        "rose: address space self-test: isolation {}",
+        if isolated { "confirmed" } else { "FAILED" }
+    );
+
+    unsafe {
+        user_as.switch();
+    }
+    let ptr = TEST_VIRT as *mut u64;
+    unsafe {
+        ptr.write_volatile(PATTERN);
+    }
+    let readback = unsafe { ptr.read_volatile() };
+    unsafe {
+        kernel_as.switch();
+    }
+    let _ = writeln!(
+        com1,
+        "rose: address space self-test: wrote {:#018x}, read {:#018x}, {}",
+        PATTERN,
+        readback,
+        if readback == PATTERN { "match" } else { "MISMATCH" }
+    );
+
+    unsafe {
+        user_as.unmap_page(TEST_VIRT);
+        mem::FRAME_ALLOCATOR.lock().free(phys);
+    }
+    let _ = writeln!(
+        com1,
+        "rose: address space self-test: unmapped, frame returned to allocator, back on kernel address space"
+    );
 }
 
 /// Exercises the heap through the actual `alloc` crate types it exists to
@@ -341,29 +409,30 @@ fn usermode_selftest(com1: &mut serial::Serial) -> ! {
     const CODE_VADDR: u64 = 0x0000_0000_0040_0000;
     const STACK_VADDR: u64 = 0x0000_0000_0060_0000;
 
+    // A real second AddressSpace now, not the kernel's currently-active
+    // one (see address_space_selftest above, first thing to exercise
+    // this primitive). CR3 doesn't point here yet, so the code page
+    // below can't be written by dereferencing CODE_VADDR directly.
+    let user_as = unsafe { paging::new_address_space() };
+
     let code_phys = mem::FRAME_ALLOCATOR
         .lock()
         .alloc()
         .expect("rose: usermode self-test: out of memory (code)");
     unsafe {
-        // Mapped WRITABLE for the copy below, then re-mapped R+X only
-        // (no WRITABLE) right after. CPL0 ignores the U/S bit absent
-        // SMAP/SMEP, but that's not the same thing as CR0.WP: a
-        // supervisor write to a page missing the WRITABLE bit still
-        // faults. First attempt at this left WRITABLE out from the
-        // start, kernel's own copy_nonoverlapping into it #PF'd
-        // immediately (error_code=0x3, W=1 U=0); see BUGS.md.
-        paging::map_page(CODE_VADDR, code_phys, paging::PAGE_USER | paging::PAGE_WRITABLE);
+        // R+X+U from the start, no WRITABLE ever: the write below goes
+        // through the frame's permanent HHDM alias instead of through
+        // CODE_VADDR, so there's no supervisor-write-to-non-writable-
+        // page fault to work around anymore (that was only ever a
+        // problem when the kernel wrote into its own currently-active
+        // mapping of the code page; see BUGS.md for the original
+        // ring3 version of this bug, now obsolete but left in place).
+        user_as.map_page(CODE_VADDR, code_phys, paging::PAGE_USER);
     }
     let program = usermode::program_bytes();
     unsafe {
-        core::ptr::copy_nonoverlapping(program.as_ptr(), CODE_VADDR as *mut u8, program.len());
-    }
-    unsafe {
-        // Re-map same virt+phys, WRITABLE dropped: map_page just
-        // overwrites the leaf PTE, no unmap needed first. Restores
-        // W^X (R+X+U only) before this page ever runs in ring 3.
-        paging::map_page(CODE_VADDR, code_phys, paging::PAGE_USER);
+        let code_virt = paging::phys_to_virt(code_phys) as *mut u8;
+        core::ptr::copy_nonoverlapping(program.as_ptr(), code_virt, program.len());
     }
 
     let stack_phys = mem::FRAME_ALLOCATOR
@@ -371,7 +440,7 @@ fn usermode_selftest(com1: &mut serial::Serial) -> ! {
         .alloc()
         .expect("rose: usermode self-test: out of memory (stack)");
     unsafe {
-        paging::map_page(
+        user_as.map_page(
             STACK_VADDR,
             stack_phys,
             paging::PAGE_USER | paging::PAGE_WRITABLE | paging::PAGE_NO_EXECUTE,
@@ -391,7 +460,10 @@ fn usermode_selftest(com1: &mut serial::Serial) -> ! {
         CODE_VADDR, user_stack_top
     );
 
-    unsafe { usermode::enter_user_mode(CODE_VADDR, user_stack_top) }
+    unsafe {
+        user_as.switch();
+        usermode::enter_user_mode(CODE_VADDR, user_stack_top)
+    }
 }
 
 static TASK_A_COUNT: AtomicU64 = AtomicU64::new(0);
