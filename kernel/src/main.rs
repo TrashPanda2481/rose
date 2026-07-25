@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+mod gdt;
+mod idt;
 mod mem;
 mod serial;
 
@@ -77,9 +79,29 @@ unsafe extern "C" fn kernel_main() -> ! {
 
     frame_allocator_selftest(&mut com1);
 
+    unsafe {
+        gdt::init();
+        idt::init();
+    }
+    let _ = writeln!(com1, "rose: gdt/idt loaded");
+
+    idt_selftest(&mut com1);
+
     loop {
         core::arch::asm!("hlt");
     }
+}
+
+/// Deliberately triggers a breakpoint exception. If GDT/IDT/TSS are wired
+/// correctly, the handler in idt.rs logs it and returns here normally,
+/// proving the whole chain works without having to crash the kernel to
+/// prove it, same spirit as the frame allocator self-test above.
+fn idt_selftest(com1: &mut serial::Serial) {
+    let _ = writeln!(com1, "rose: idt self-test: triggering breakpoint");
+    unsafe {
+        core::arch::asm!("int3");
+    }
+    let _ = writeln!(com1, "rose: idt self-test: resumed after breakpoint, ok");
 }
 
 fn frame_allocator_selftest(com1: &mut serial::Serial) {

@@ -1,6 +1,6 @@
 # Kernel core
 
-Status: boots. Entry point + serial output working on BIOS and UEFI in QEMU, and verified in Oracle VM VirtualBox. Limine's memory map is parsed and logged (base/length/type per region, usable total). Physical frame allocator is in (`kernel/src/mem.rs`), free-list based, addressed via HHDM, verified with a self-test on boot. Capabilities/IPC/scheduler below are still spec only, not implemented.
+Status: boots. Entry point + serial output working on BIOS and UEFI in QEMU, and verified in Oracle VM VirtualBox. Limine's memory map is parsed and logged (base/length/type per region, usable total). Physical frame allocator is in (`kernel/src/mem.rs`), free-list based, addressed via HHDM, verified with a self-test on boot. Our own GDT/IDT/TSS are loaded (`kernel/src/gdt.rs`, `kernel/src/idt.rs`), all 32 CPU exception vectors handled, double fault backed by an IST stack, verified with a breakpoint self-test on boot plus manual #GP/#PF fault injection during development. Capabilities/IPC/scheduler below are still spec only, not implemented.
 
 ## Boot, concretely
 
