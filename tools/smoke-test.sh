@@ -20,7 +20,11 @@ timeout 15 qemu-system-x86_64 \
     -no-shutdown \
     -m 256M &
 QEMU_PID=$!
-sleep 8
+for remaining in 8 7 6 5 4 3 2 1; do
+    printf "\rwaiting for boot... %ds remaining " "$remaining"
+    sleep 1
+done
+printf "\rwaiting for boot... done              \n"
 kill -9 "$QEMU_PID" 2>/dev/null
 wait 2>/dev/null
 

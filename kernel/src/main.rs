@@ -274,9 +274,26 @@ fn timer_selftest(com1: &mut serial::Serial) {
     let target_ticks = start_ticks + 50;
     let start_tsc = rdtsc();
 
+    // Countdown printed to serial so a real wait (this loop can run
+    // several real seconds on a host slower than the assumed ceiling,
+    // see the comment above) doesn't look identical to a hang. Divides
+    // the assumed-seconds budget into WAIT_SECONDS chunks and prints
+    // once per chunk crossed; ticks against the same TSC/ceiling math
+    // the loop's own bailout uses, not a real-time clock, so on a host
+    // slower than the ceiling the printed countdown runs slower than
+    // an actual second per step.
+    let mut seconds_left = WAIT_SECONDS;
+    let mut next_countdown_at = cycle_budget / WAIT_SECONDS;
+
     while timer::ticks() < target_ticks {
-        if rdtsc().wrapping_sub(start_tsc) > cycle_budget {
+        let elapsed = rdtsc().wrapping_sub(start_tsc);
+        if elapsed > cycle_budget {
             break;
+        }
+        if elapsed >= next_countdown_at && seconds_left > 0 {
+            seconds_left -= 1;
+            let _ = writeln!(com1, "rose: timer self-test: {}s remaining...", seconds_left);
+            next_countdown_at += cycle_budget / WAIT_SECONDS;
         }
         core::hint::spin_loop();
     }
