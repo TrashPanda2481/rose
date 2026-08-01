@@ -171,6 +171,34 @@ pub fn with_current_cspace<R>(f: impl FnOnce(&mut CSpace) -> R) -> R {
     f(&mut scheduler.tasks[current].cspace)
 }
 
+/// Updates whichever task is current at the moment of the call to run
+/// in `new_as` from now on, and reloads CR3 into it immediately, both
+/// under the same cli/sti bracket so no real timer tick can land
+/// between the two and see a mismatched pair. Needed for exactly one
+/// caller today: `usermode_selftest`'s manual switch into a second
+/// AddressSpace right before dropping to ring 3. Without this, the
+/// Task's own `address_space` field (whatever `init`/`spawn` set it to)
+/// never learns about the change, and the next real preemption reloads
+/// CR3 from that stale field instead, straight back to whatever it was
+/// before, out from under a still-running ring-3 program. Same
+/// cli/sti reasoning as `yield_now`'s own bracket: a tick landing
+/// mid-update could see a half-written Task, or spin forever trying to
+/// re-lock SCHEDULER against itself.
+pub fn set_current_address_space(new_as: AddressSpace) {
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+    }
+    {
+        let mut scheduler = SCHEDULER.lock();
+        let current = scheduler.current;
+        scheduler.tasks[current].address_space = new_as;
+    }
+    unsafe {
+        new_as.switch();
+        core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+    }
+}
+
 /// Called only from the timer IRQ handler in idt.rs, once per tick, with
 /// IF already 0 (interrupt gate). Decrements the current task's
 /// timeslice and switches to the next task round-robin once it runs

@@ -505,10 +505,17 @@ fn usermode_selftest(com1: &mut serial::Serial) -> ! {
         CODE_VADDR, user_stack_top
     );
 
-    unsafe {
-        user_as.switch();
-        usermode::enter_user_mode(CODE_VADDR, user_stack_top)
-    }
+    // Handing off to a manual CR3 switch alone would leave task 0's own
+    // Task.address_space field pointing at the kernel's own AddressSpace
+    // (set once at scheduler::init(), never touched since); the next
+    // real preemption would reload CR3 from that stale field, straight
+    // out from under this still-running ring-3 program. Updating the
+    // field and reloading CR3 together via set_current_address_space
+    // keeps the two in sync. See BUGS.md, "real hardware timer
+    // preemption during ring-3 self-test reverts CR3 to the kernel
+    // AddressSpace".
+    scheduler::set_current_address_space(user_as);
+    unsafe { usermode::enter_user_mode(CODE_VADDR, user_stack_top) }
 }
 
 static TASK_A_COUNT: AtomicU64 = AtomicU64::new(0);
