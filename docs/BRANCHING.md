@@ -17,6 +17,7 @@ Track every main → stable merge here. Newest first.
 ```
 Date        Commit      What it proves works
 ----        ------      ---------------------
+2026-08-01  93a2fc5     Capabilities/CSpace v0.1, CSpace syscalls, Untyped/Retype v0.1, and the task 0 address-space sync fix, verified end to end on QEMU (BIOS+UEFI) and Oracle VM VirtualBox.
 2026-07-25  29207ce     Memory map parsing + physical frame allocator, verified on QEMU (BIOS+UEFI) and Oracle VM VirtualBox.
 2026-07-25  9235f89     Kernel boots and reaches the smoke-test serial output on both QEMU (BIOS+UEFI) and Oracle VM VirtualBox.
 ```
