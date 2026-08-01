@@ -15,7 +15,7 @@ Project is split into cores. Each core owns its own README, CHANGELOG, BUGS, and
 | kernel | capabilities, IPC, address spaces, scheduler, boot handoff | boots (serial hello-world); capabilities/IPC/scheduler not implemented yet |
 | adaptive | real-time usage/intent understanding, native successor to Compass | deferred, stub only; see docs/cores/adaptive/README.md |
 
-See `docs/VISION.md` for the end-state goal and the bespoke-vs-standard heuristic behind these decisions.
+See `docs/VISION.md` for the end-state goal and the bespoke-vs-standard heuristic behind these decisions. See `docs/TRANSITION.md` for the phased path off Debian's kernel and onto Rose.
 
 ## Design bets
 

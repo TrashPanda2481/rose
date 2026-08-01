@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+mod cspace;
 mod gdt;
 mod heap;
 mod idt;
@@ -12,9 +13,12 @@ mod paging;
 mod pic;
 mod scheduler;
 mod serial;
+mod syscall;
 mod timer;
+mod untyped;
 mod usermode;
 
+use abi::{Capability, KernelObjectId, ObjectType, Rights};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -147,6 +151,8 @@ unsafe extern "C" fn kernel_main() -> ! {
     scheduler_selftest(&mut com1);
 
     scheduled_address_space_selftest(&mut com1);
+
+    cspace_selftest(&mut com1);
 
     usermode_selftest(&mut com1)
 }
@@ -456,16 +462,60 @@ fn usermode_selftest(com1: &mut serial::Serial) -> ! {
         gdt::set_kernel_stack(scratch_top);
     }
 
+    // Boot handoff stand-in: task 0's own CSpace slot 1 gets a root
+    // cap over the kernel AddressSpace, exactly like cspace_selftest's
+    // grant_root above but through the scheduler-owned CSpace this
+    // time, since it's task 0's copy that the ring-3 program's own
+    // syscalls (see usermode.rs) will copy/mint/move/revoke against.
+    // Without this, the first CSpace syscall the program issues would
+    // just come back SourceEmpty against an empty slot 1.
+    let full_rights = Rights::READ.union(Rights::WRITE).union(Rights::MAP);
+    let root_cap = Capability {
+        object_ref: KernelObjectId(paging::kernel_address_space().raw()),
+        object_type: ObjectType::AddressSpace,
+        rights: full_rights,
+        badge: 0,
+    };
+    scheduler::with_current_cspace(|cspace| cspace.grant_root(1, root_cap))
+        .expect("rose: usermode self-test: cspace grant_root failed");
+
+    // Same boot-handoff stand-in, extended for Retype: task 0's own
+    // CSpace slot 6 gets a root cap over a fresh 2-frame Untyped pool
+    // (untyped.rs), so the ring-3 program's four Retype steps (see
+    // usermode.rs) have something real to retype from instead of
+    // hitting InvalidUntyped against an empty slot 6. Two frames, not
+    // one: the sequence deliberately retypes twice successfully (a
+    // Frame and a CSpace) before a third retype is expected to hit
+    // Exhausted, so the pool has to run out exactly then, not sooner.
+    let untyped_object = untyped::UntypedObject::new(2)
+        .expect("rose: usermode self-test: out of memory (untyped pool)");
+    let untyped_id = untyped::register_untyped(untyped_object);
+    let untyped_cap = Capability {
+        object_ref: KernelObjectId(untyped_id),
+        object_type: ObjectType::Untyped,
+        rights: full_rights,
+        badge: 0,
+    };
+    scheduler::with_current_cspace(|cspace| cspace.grant_root(6, untyped_cap))
+        .expect("rose: usermode self-test: cspace grant_root (untyped) failed");
+
     let _ = writeln!(
         com1,
         "rose: usermode self-test: entering ring 3 at {:#018x}, stack top {:#018x}",
         CODE_VADDR, user_stack_top
     );
 
-    unsafe {
-        user_as.switch();
-        usermode::enter_user_mode(CODE_VADDR, user_stack_top)
-    }
+    // Handing off to a manual CR3 switch alone would leave task 0's own
+    // Task.address_space field pointing at the kernel's own AddressSpace
+    // (set once at scheduler::init(), never touched since); the next
+    // real preemption would reload CR3 from that stale field, straight
+    // out from under this still-running ring-3 program. Updating the
+    // field and reloading CR3 together via set_current_address_space
+    // keeps the two in sync. See BUGS.md, "real hardware timer
+    // preemption during ring-3 self-test reverts CR3 to the kernel
+    // AddressSpace".
+    scheduler::set_current_address_space(user_as);
+    unsafe { usermode::enter_user_mode(CODE_VADDR, user_stack_top) }
 }
 
 static TASK_A_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -640,6 +690,75 @@ fn scheduled_address_space_selftest(com1: &mut serial::Serial) {
         TASK_D_RESULT.load(Ordering::Relaxed),
         if b_ok { "match" } else { "MISMATCH" },
         if a_ok && b_ok { "confirmed" } else { "FAILED" }
+    );
+}
+
+/// Proves the derivation tree in cspace.rs actually works, not just
+/// that a single grant round-trips. Grants a root capability over the
+/// kernel's own AddressSpace (standing in for the real "Boot handoff"
+/// root grant until there's a real root task to receive it), copies
+/// it to a sibling slot, mints a narrowed-rights badged child into a
+/// third slot, then revokes the original and checks all three slots
+/// emptied out. No syscall involved; this calls cspace::CSpace's
+/// methods directly, see the module doc in cspace.rs for what's still
+/// missing before that's possible.
+fn cspace_selftest(com1: &mut serial::Serial) {
+    let mut cspace = cspace::CSpace::new();
+    let kernel_as = paging::kernel_address_space();
+    let full_rights = Rights::READ.union(Rights::WRITE).union(Rights::MAP);
+    let root_cap = Capability {
+        object_ref: KernelObjectId(kernel_as.raw()),
+        object_type: ObjectType::AddressSpace,
+        rights: full_rights,
+        badge: 0,
+    };
+
+    cspace
+        .grant_root(1, root_cap)
+        .expect("rose: cspace self-test: grant_root failed");
+    cspace
+        .copy(1, 2, full_rights)
+        .expect("rose: cspace self-test: copy failed");
+
+    // Re-home the copy from slot 2 to slot 4. Exercises move_slot's
+    // tree-repointing: slot 2 must go empty and slot 4 must still be
+    // tracked as a child of slot 1, so a later revoke(1) still reaches
+    // it under its new name.
+    cspace
+        .move_slot(2, 4)
+        .expect("rose: cspace self-test: move_slot failed");
+    let move_cleared_src = cspace.lookup(2).is_none();
+
+    let minted_rights = Rights::READ;
+    let minted_badge: u64 = 0xc0ffee;
+    cspace
+        .mint(1, 3, minted_rights, minted_badge)
+        .expect("rose: cspace self-test: mint failed");
+
+    let cap1 = cspace.lookup(1).expect("rose: cspace self-test: slot 1 missing before revoke");
+    let cap4 = cspace.lookup(4).expect("rose: cspace self-test: slot 4 missing before revoke");
+    let cap3 = cspace.lookup(3).expect("rose: cspace self-test: slot 3 missing before revoke");
+
+    let refs_match = cap1.object_ref == cap4.object_ref && cap4.object_ref == cap3.object_ref;
+    let mint_narrowed =
+        cap3.rights == minted_rights && cap3.badge == minted_badge && cap3.rights != cap1.rights;
+
+    cspace
+        .revoke(1)
+        .expect("rose: cspace self-test: revoke failed");
+
+    let all_cleared =
+        cspace.lookup(1).is_none() && cspace.lookup(3).is_none() && cspace.lookup(4).is_none();
+
+    let ok = move_cleared_src && refs_match && mint_narrowed && all_cleared;
+    let _ = writeln!(
+        com1,
+        "rose: cspace self-test: move cleared source slot {}, copy/mint object_ref {}, mint narrowed rights+badge {}, revoke cascade cleared moved+minted+root {}, overall {}",
+        if move_cleared_src { "ok" } else { "FAILED" },
+        if refs_match { "match" } else { "MISMATCH" },
+        if mint_narrowed { "ok" } else { "FAILED" },
+        if all_cleared { "ok" } else { "FAILED" },
+        if ok { "confirmed" } else { "FAILED" }
     );
 }
 

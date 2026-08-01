@@ -88,6 +88,17 @@ pub struct AddressSpace {
     pml4_phys: u64,
 }
 
+impl AddressSpace {
+    /// The PML4 physical address, exposed so callers outside this
+    /// module can use it as a stable identity, e.g. a Capability's
+    /// `KernelObjectId` for an AddressSpace object. Not itself a
+    /// capability check or a safety boundary; the CSpace/rights layer
+    /// on top of this is what actually gates who can act on it.
+    pub fn raw(&self) -> u64 {
+        self.pml4_phys
+    }
+}
+
 /// Same value Limine reported via HhdmRequest. Set once by `build()`,
 /// read by every `map_*` call afterward; never changes after that.
 static mut HHDM_OFFSET: u64 = 0;
