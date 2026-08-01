@@ -480,14 +480,15 @@ fn usermode_selftest(com1: &mut serial::Serial) -> ! {
         .expect("rose: usermode self-test: cspace grant_root failed");
 
     // Same boot-handoff stand-in, extended for Retype: task 0's own
-    // CSpace slot 6 gets a root cap over a fresh 2-frame Untyped pool
-    // (untyped.rs), so the ring-3 program's four Retype steps (see
+    // CSpace slot 6 gets a root cap over a fresh 4-frame Untyped pool
+    // (untyped.rs), so the ring-3 program's six Retype steps (see
     // usermode.rs) have something real to retype from instead of
-    // hitting InvalidUntyped against an empty slot 6. Two frames, not
-    // one: the sequence deliberately retypes twice successfully (a
-    // Frame and a CSpace) before a third retype is expected to hit
-    // Exhausted, so the pool has to run out exactly then, not sooner.
-    let untyped_object = untyped::UntypedObject::new(2)
+    // hitting InvalidUntyped against an empty slot 6. Four frames, not
+    // two: the sequence now retypes four times successfully (Frame,
+    // CSpace, AddressSpace, Thread) before a fifth retype is expected
+    // to hit Exhausted, so the pool has to run out exactly then, not
+    // sooner.
+    let untyped_object = untyped::UntypedObject::new(4)
         .expect("rose: usermode self-test: out of memory (untyped pool)");
     let untyped_id = untyped::register_untyped(untyped_object);
     let untyped_cap = Capability {

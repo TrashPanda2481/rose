@@ -149,9 +149,19 @@ pub fn dispatch_untyped(arg1: u64, arg2: u64, arg3: u64) -> u64 {
         // READ/WRITE/MAP since paging will eventually need all three
         // to map it; CSpace gets GRANT since installing further caps
         // into it is the only operation a CSpace cap itself gates.
+        // AddressSpace gets MAP, the right a future Frame.Map syscall
+        // will need to check on the *target* AddressSpace cap before
+        // letting a Frame be mapped into it. Thread gets GRANT, same
+        // loose "the one right this type's ops gate" convention as
+        // CSpace; provisional until the Configure/Resume/Suspend/
+        // SetPriority syscalls actually define per-op permission
+        // checks, at which point this may need to split into more
+        // than one bit.
         let rights = match object_type {
             ObjectType::Frame => Rights::READ.union(Rights::WRITE).union(Rights::MAP),
             ObjectType::CSpace => Rights::GRANT,
+            ObjectType::AddressSpace => Rights::MAP,
+            ObjectType::Thread => Rights::GRANT,
             _ => unreachable!("untyped::retype already rejected every other ObjectType"),
         };
         let new_cap = Capability {
