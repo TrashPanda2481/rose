@@ -54,6 +54,20 @@ impl Rights {
     pub const fn is_subset_of(self, superset: Rights) -> bool {
         self.0 & !superset.0 == 0
     }
+
+    /// Raw bitfield value, for a syscall ABI to pass across the ring
+    /// 3/ring 0 boundary as a plain register value; there's no other
+    /// way for userspace to name a rights set. See `from_bits`.
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Builds a Rights from a raw register value. No validation: every
+    /// bit above the five defined ones is simply meaningless and
+    /// ignored by every check here, same as an unused CPU flag bit.
+    pub const fn from_bits(bits: u8) -> Rights {
+        Rights(bits)
+    }
 }
 
 /// Meaning is per-ObjectType, not a single global namespace: an

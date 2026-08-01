@@ -13,6 +13,7 @@ mod paging;
 mod pic;
 mod scheduler;
 mod serial;
+mod syscall;
 mod timer;
 mod usermode;
 
@@ -459,6 +460,23 @@ fn usermode_selftest(com1: &mut serial::Serial) -> ! {
             core::ptr::addr_of!(KERNEL_SCRATCH_STACK) as u64 + KERNEL_SCRATCH_STACK_SIZE as u64;
         gdt::set_kernel_stack(scratch_top);
     }
+
+    // Boot handoff stand-in: task 0's own CSpace slot 1 gets a root
+    // cap over the kernel AddressSpace, exactly like cspace_selftest's
+    // grant_root above but through the scheduler-owned CSpace this
+    // time, since it's task 0's copy that the ring-3 program's own
+    // syscalls (see usermode.rs) will copy/mint/move/revoke against.
+    // Without this, the first CSpace syscall the program issues would
+    // just come back SourceEmpty against an empty slot 1.
+    let full_rights = Rights::READ.union(Rights::WRITE).union(Rights::MAP);
+    let root_cap = Capability {
+        object_ref: KernelObjectId(paging::kernel_address_space().raw()),
+        object_type: ObjectType::AddressSpace,
+        rights: full_rights,
+        badge: 0,
+    };
+    scheduler::with_current_cspace(|cspace| cspace.grant_root(1, root_cap))
+        .expect("rose: usermode self-test: cspace grant_root failed");
 
     let _ = writeln!(
         com1,

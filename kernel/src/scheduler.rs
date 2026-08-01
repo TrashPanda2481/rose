@@ -27,6 +27,7 @@
 // a future component to actually run isolated in its own AddressSpace
 // under real preemption, not just a single manual switch.
 
+use crate::cspace::CSpace;
 use crate::mem::SpinLock;
 use crate::paging::{self, AddressSpace};
 use alloc::boxed::Box;
@@ -49,6 +50,12 @@ struct Task {
     // defaults to the kernel's, `spawn_in` picks any. Copy type (a
     // PML4 physical address), cheap to hold by value.
     address_space: AddressSpace,
+    // Every task gets its own empty CSpace at creation. Nothing is
+    // reachable through a syscall until something (boot handoff today,
+    // a parent task later) explicitly grants a root capability into
+    // it; see cspace.rs's own doc comment ("if it's not in your
+    // CSpace, it doesn't exist for you").
+    cspace: CSpace,
 }
 
 struct Scheduler {
@@ -74,6 +81,7 @@ pub unsafe fn init() {
         saved_rsp: 0,
         _stack: None,
         address_space: paging::kernel_address_space(),
+        cspace: CSpace::new(),
     });
     scheduler.current = 0;
     scheduler.ticks_left = TIMESLICE_TICKS;
@@ -146,8 +154,21 @@ pub fn spawn_in(entry: fn(), address_space: AddressSpace) -> usize {
         saved_rsp: sp,
         _stack: Some(stack),
         address_space,
+        cspace: CSpace::new(),
     });
     scheduler.tasks.len() - 1
+}
+
+/// Runs `f` against whichever task is current at the moment of the
+/// call, i.e. the one that trapped in via the syscall path calling
+/// this. Locks the same SCHEDULER lock as tick()/yield_now(); safe to
+/// call from the syscall dispatch path since that only ever runs with
+/// interrupts enabled from ring 3 (not from inside tick()'s own
+/// already-locked section).
+pub fn with_current_cspace<R>(f: impl FnOnce(&mut CSpace) -> R) -> R {
+    let mut scheduler = SCHEDULER.lock();
+    let current = scheduler.current;
+    f(&mut scheduler.tasks[current].cspace)
 }
 
 /// Called only from the timer IRQ handler in idt.rs, once per tick, with

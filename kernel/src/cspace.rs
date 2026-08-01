@@ -66,6 +66,23 @@ pub enum CSpaceError {
     RightsEscalation,
 }
 
+impl CSpaceError {
+    /// Stable small integer per variant. Used by the syscall layer
+    /// (syscall.rs) to encode a failure into a single return register:
+    /// 0 or positive means success, negative means an error whose
+    /// magnitude is this code. Kept next to the enum so the two never
+    /// drift apart; nothing outside this file should invent its own
+    /// mapping.
+    pub fn code(&self) -> u8 {
+        match self {
+            CSpaceError::InvalidSlot => 1,
+            CSpaceError::SourceEmpty => 2,
+            CSpaceError::DestOccupied => 3,
+            CSpaceError::RightsEscalation => 4,
+        }
+    }
+}
+
 impl CSpace {
     pub fn new() -> CSpace {
         CSpace {

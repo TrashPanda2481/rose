@@ -30,6 +30,7 @@ use crate::mem::SpinLock;
 use crate::pic;
 use crate::scheduler;
 use crate::serial;
+use crate::syscall;
 use crate::timer;
 use crate::usermode;
 
@@ -183,7 +184,14 @@ fn read_cr2() -> u64 {
 /// only honest option for anything that isn't the deliberate self-test.
 #[unsafe(no_mangle)]
 extern "C" fn rose_exception_handler(frame: *mut InterruptFrame) {
-    let frame = unsafe { &*frame };
+    // Mutable, not the original shared reference: writing a result
+    // back into frame.regs.rax below is what lets a CSpace syscall
+    // actually return a value to ring 3. Sound because the pointer
+    // this came in as was already *mut InterruptFrame (common_stub
+    // hands off `rsp` into a region it exclusively owns for the
+    // duration of this call), so reborrowing it mutably here doesn't
+    // create any aliasing that wasn't already possible.
+    let frame = unsafe { &mut *frame };
     let vector = frame.vector;
 
     if vector == SYSCALL_VECTOR as u64 {
@@ -192,7 +200,28 @@ extern "C" fn rose_exception_handler(frame: *mut InterruptFrame) {
         // special-cased ahead of the generic exception-logging path:
         // this is an expected, frequent, non-error control transfer,
         // not something to run through the fatal-by-default handler.
-        usermode::on_syscall(frame.regs.rax);
+        //
+        // Two families share this one vector: the legacy sentinel
+        // self-test (0xabcd1234, 1, predating any real ABI, no return
+        // value ever used) and the real CSpace syscalls. Routed by
+        // number, not by anything structural, since both arrive the
+        // same way (int 0x80).
+        if syscall::is_cspace_syscall(frame.regs.rax) {
+            let num = frame.regs.rax;
+            let arg1 = frame.regs.rdi;
+            let arg2 = frame.regs.rsi;
+            let arg3 = frame.regs.rdx;
+            let arg4 = frame.regs.r10;
+            let result = syscall::dispatch(num, arg1, arg2, arg3, arg4);
+            usermode::on_cspace_syscall(num, arg1, arg2, arg3, arg4, result);
+            // Written into the saved-register area common_stub will
+            // pop rax from right before iretq, so this is what ring 3
+            // actually sees land in its own rax after the int 0x80
+            // returns.
+            frame.regs.rax = result;
+        } else {
+            usermode::on_syscall(frame.regs.rax);
+        }
         return;
     }
 
