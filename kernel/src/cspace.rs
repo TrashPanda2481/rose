@@ -23,6 +23,11 @@
 //     Building a real kernel-object heap out of Untyped is its own
 //     feature, deferred until something other than a self-test needs
 //     to retype memory into a new object.
+//     Update: Untyped/Retype landed as its own feature (see
+//     kernel/src/untyped.rs). `install_child` below is what lets
+//     Retype's syscall install a freshly-created Frame/CSpace cap as
+//     a child of the Untyped cap it came from, reusing this file's
+//     existing derivation tree instead of building a second one.
 
 use abi::{Capability, CPtr, Rights};
 
@@ -204,6 +209,66 @@ impl CSpace {
                 .push(dst);
         }
 
+        Ok(())
+    }
+
+    /// Checks `dst` is a real, currently-empty slot, without
+    /// installing anything into it. `lookup` alone can't answer this:
+    /// it returns `None` for both an invalid cptr and a valid empty
+    /// one, and Retype (untyped.rs's `retype`, called from
+    /// syscall.rs's `dispatch_untyped`) needs to tell those apart
+    /// *before* consuming a frame from the Untyped pool, not after;
+    /// a frame consumed against a `dst` that turns out to be invalid
+    /// has no way back into the pool (see untyped.rs's module doc on
+    /// reclamation not existing yet).
+    pub fn slot_is_available(&self, cptr: CPtr) -> Result<(), CSpaceError> {
+        let index = Self::check_slot(cptr)?;
+        if self.slots[index].is_some() {
+            return Err(CSpaceError::DestOccupied);
+        }
+        Ok(())
+    }
+
+    /// Installs `cap` into `dst`, recorded as a child of `parent` in
+    /// the derivation tree, same bookkeeping `copy`/`mint` already do
+    /// via `derive`. `parent` must already hold a capability; `dst`
+    /// must be empty. Used by Retype (untyped.rs's `retype`, wired up
+    /// through syscall.rs's `dispatch_untyped`) to install a freshly
+    /// created Frame/CSpace cap as a child of the Untyped cap it was
+    /// retyped from, so revoking the Untyped cascades into it for
+    /// free, same as any other derived cap. Doesn't itself check
+    /// `cap`'s rights against `parent`'s: unlike `derive`, this isn't
+    /// narrowing a view of the same object, it's installing a
+    /// reference to a brand new one, so there's no source rights set
+    /// to be a subset of.
+    pub fn install_child(
+        &mut self,
+        parent: CPtr,
+        dst: CPtr,
+        cap: Capability,
+    ) -> Result<(), CSpaceError> {
+        let parent_index = Self::check_slot(parent)?;
+        let dst_index = Self::check_slot(dst)?;
+        if parent_index == dst_index {
+            return Err(CSpaceError::InvalidSlot);
+        }
+        if self.slots[parent_index].is_none() {
+            return Err(CSpaceError::SourceEmpty);
+        }
+        if self.slots[dst_index].is_some() {
+            return Err(CSpaceError::DestOccupied);
+        }
+
+        self.slots[dst_index] = Some(CapSlot {
+            cap,
+            parent: Some(parent),
+            children: alloc::vec::Vec::new(),
+        });
+        self.slots[parent_index]
+            .as_mut()
+            .expect("rose: cspace: parent slot vanished mid-install")
+            .children
+            .push(dst);
         Ok(())
     }
 

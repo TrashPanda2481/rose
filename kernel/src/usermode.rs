@@ -19,7 +19,9 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::gdt;
 use crate::serial;
-use crate::syscall::{SYS_CSPACE_COPY, SYS_CSPACE_MINT, SYS_CSPACE_MOVE, SYS_CSPACE_REVOKE};
+use crate::syscall::{
+    SYS_CSPACE_COPY, SYS_CSPACE_MINT, SYS_CSPACE_MOVE, SYS_CSPACE_REVOKE, SYS_UNTYPED_RETYPE,
+};
 
 // Hand-written user-mode machine code, not compiled Rust: there's no
 // user-mode runtime (no allocator, no panic handler, nothing) for a
@@ -49,6 +51,14 @@ use crate::syscall::{SYS_CSPACE_COPY, SYS_CSPACE_MINT, SYS_CSPACE_MOVE, SYS_CSPA
 //   4. COPY   slot1 -> slot3 (already occupied by the mint)    -> DestOccupied
 //   5. REVOKE slot1 (cascades: clears slot3 and slot4)          -> 0 (ok)
 //   6. COPY   slot1 -> slot5 (slot1 just revoked, now empty)    -> SourceEmpty
+// Extended past the six CSpace steps with a fixed four-step Retype
+// sequence, against slot6 (a root Untyped cap over a 2-frame pool,
+// see main.rs's usermode_selftest). Cross-checked against
+// on_untyped_syscall's UNTYPED_SYSCALL_STEPS table below:
+//   7.  RETYPE slot6 -> slot7,  Frame  (1)                      -> ok
+//   8.  RETYPE slot6 -> slot8,  CSpace (9)                      -> ok
+//   9.  RETYPE slot6 -> slot9,  Frame  (1) (pool now empty)     -> Exhausted
+//   10. RETYPE slot6 -> slot10, Thread (4) (not retypeable)     -> UnsupportedType
 core::arch::global_asm!(
     ".section .rodata.user_program, \"a\"",
     ".global user_program_start",
@@ -91,6 +101,31 @@ core::arch::global_asm!(
     "mov rsi, 5",
     "mov rdx, 0xb",
     "mov rax, 0x1000",
+    "int 0x80",
+    // 7: RETYPE slot6 -> slot7, Frame (1), expect ok
+    "mov rdi, 6",
+    "mov rsi, 1",
+    "mov rdx, 7",
+    "mov rax, 0x1004",
+    "int 0x80",
+    // 8: RETYPE slot6 -> slot8, CSpace (9), expect ok
+    "mov rdi, 6",
+    "mov rsi, 9",
+    "mov rdx, 8",
+    "mov rax, 0x1004",
+    "int 0x80",
+    // 9: RETYPE slot6 -> slot9, Frame (1), expect Exhausted (pool of
+    // 2 frames already spent by steps 7 and 8)
+    "mov rdi, 6",
+    "mov rsi, 1",
+    "mov rdx, 9",
+    "mov rax, 0x1004",
+    "int 0x80",
+    // 10: RETYPE slot6 -> slot10, Thread (4), expect UnsupportedType
+    "mov rdi, 6",
+    "mov rsi, 4",
+    "mov rdx, 10",
+    "mov rax, 0x1004",
     "int 0x80",
     "2:",
     "jmp 2b",
@@ -212,6 +247,109 @@ pub fn on_cspace_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, r
             com1,
             "rose: cspace syscall self-test: sequence complete, overall {}",
             if all_ok { "confirmed" } else { "FAILED" }
+        );
+        // No halt here anymore: the ring-3 program's ordering table
+        // above now continues straight into the four Retype steps
+        // after this sixth CSpace one, so control must fall back out
+        // to whatever called this (idt.rs's handler, then back to
+        // ring 3 via iretq) instead of stopping the CPU. The true
+        // final halt moved to on_untyped_syscall below.
+    }
+}
+
+/// Outcome an untyped syscall self-test step expects, for the table
+/// below. Unlike CSPACE_SYSCALL_STEPS's plain `u64`, a successful
+/// Retype's return value (a physical address for Frame, a
+/// CSPACE_OBJECTS registry index for CSpace, see untyped.rs's
+/// `retype`) isn't known ahead of time the way a fixed CSpaceError
+/// code is; `Success` just checks the result is non-negative
+/// (something was actually minted) rather than pinning an exact id.
+enum ExpectedOutcome {
+    Success,
+    Error(u64),
+}
+
+static UNTYPED_SYSCALL_STEP: AtomicU64 = AtomicU64::new(0);
+static UNTYPED_SYSCALL_ALL_OK: AtomicBool = AtomicBool::new(true);
+
+/// One row per syscall in the fixed four-step Retype sequence
+/// appended to the ring-3 program above, run immediately after the
+/// six CSpace steps; index must line up with call order exactly.
+const UNTYPED_SYSCALL_STEPS: [(&str, ExpectedOutcome); 4] = [
+    ("retype slot6->slot7 Frame", ExpectedOutcome::Success),
+    ("retype slot6->slot8 CSpace", ExpectedOutcome::Success),
+    (
+        "retype slot6->slot9 Frame (pool exhausted)",
+        ExpectedOutcome::Error((-12i64) as u64),
+    ),
+    (
+        "retype slot6->slot10 Thread (unsupported type)",
+        ExpectedOutcome::Error((-13i64) as u64),
+    ),
+];
+
+/// Called from idt.rs's rose_exception_handler for every `int 0x80`
+/// carrying the Retype syscall number. Verifies each of the four
+/// against UNTYPED_SYSCALL_STEPS in order and, once the last one
+/// lands, prints the aggregated verdict and halts for good. This is
+/// now the true final halt for the whole boot self-test chain (see
+/// on_cspace_syscall's own comment on why its old halt moved here):
+/// the CSpace sequence falls straight through into this one, and this
+/// one's halt is what actually stops the CPU.
+pub fn on_untyped_syscall(arg1: u64, arg2: u64, arg3: u64, result: u64) {
+    let mut com1 = serial::Serial::init();
+    let step = UNTYPED_SYSCALL_STEP.fetch_add(1, Ordering::Relaxed);
+
+    let Some(&(label, ref expected)) = UNTYPED_SYSCALL_STEPS.get(step as usize) else {
+        // More Retype syscalls arrived than the fixed sequence
+        // expects; same fail-closed reasoning as on_cspace_syscall's
+        // matching branch above.
+        let _ = writeln!(
+            com1,
+            "rose: untyped syscall self-test: unexpected step {} (num={:#x}), FAILED",
+            step + 1,
+            SYS_UNTYPED_RETYPE
+        );
+        UNTYPED_SYSCALL_ALL_OK.store(false, Ordering::Relaxed);
+        return;
+    };
+
+    let ok = match *expected {
+        ExpectedOutcome::Success => (result as i64) >= 0,
+        ExpectedOutcome::Error(code) => result == code,
+    };
+    if !ok {
+        UNTYPED_SYSCALL_ALL_OK.store(false, Ordering::Relaxed);
+    }
+
+    let _ = writeln!(
+        com1,
+        "rose: untyped syscall self-test: step {} {} (args={:#x},{:#x},{:#x}) result={:#x} {}",
+        step + 1,
+        label,
+        arg1,
+        arg2,
+        arg3,
+        result,
+        if ok { "ok" } else { "FAILED" }
+    );
+
+    if step + 1 >= UNTYPED_SYSCALL_STEPS.len() as u64 {
+        let cspace_ok = CSPACE_SYSCALL_ALL_OK.load(Ordering::Relaxed);
+        let untyped_ok = UNTYPED_SYSCALL_ALL_OK.load(Ordering::Relaxed);
+        let _ = writeln!(
+            com1,
+            "rose: untyped syscall self-test: sequence complete, overall {}",
+            if untyped_ok { "confirmed" } else { "FAILED" }
+        );
+        let _ = writeln!(
+            com1,
+            "rose: usermode self-test: full boot sequence {}",
+            if cspace_ok && untyped_ok {
+                "confirmed"
+            } else {
+                "FAILED"
+            }
         );
         loop {
             unsafe { core::arch::asm!("hlt") };

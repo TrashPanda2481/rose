@@ -24,6 +24,50 @@ pub enum ObjectType {
     CSpace,
 }
 
+impl ObjectType {
+    /// Raw discriminant, for a syscall ABI (Retype, see
+    /// kernel/src/untyped.rs) to pass this across the ring 3/ring 0
+    /// boundary as a plain register value, same convention as
+    /// `Rights::bits()`/`from_bits`. Written as an explicit match
+    /// rather than `as u8`: this is the first time a variant's
+    /// numeric value crosses a real ABI boundary, so the mapping is
+    /// pinned here on purpose instead of quietly riding on whatever
+    /// order the variants happen to be declared in above.
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            ObjectType::Untyped => 0,
+            ObjectType::Frame => 1,
+            ObjectType::PageTable => 2,
+            ObjectType::AddressSpace => 3,
+            ObjectType::Thread => 4,
+            ObjectType::Endpoint => 5,
+            ObjectType::Notification => 6,
+            ObjectType::Reply => 7,
+            ObjectType::IrqHandler => 8,
+            ObjectType::CSpace => 9,
+        }
+    }
+
+    /// Inverse of `to_u8`. `None` for any value with no matching
+    /// variant; a syscall handler decoding a register value has no
+    /// other way to reject garbage than this.
+    pub const fn from_u8(value: u8) -> Option<ObjectType> {
+        match value {
+            0 => Some(ObjectType::Untyped),
+            1 => Some(ObjectType::Frame),
+            2 => Some(ObjectType::PageTable),
+            3 => Some(ObjectType::AddressSpace),
+            4 => Some(ObjectType::Thread),
+            5 => Some(ObjectType::Endpoint),
+            6 => Some(ObjectType::Notification),
+            7 => Some(ObjectType::Reply),
+            8 => Some(ObjectType::IrqHandler),
+            9 => Some(ObjectType::CSpace),
+            _ => None,
+        }
+    }
+}
+
 /// Bitfield, not an enum: a cap can hold any combination. Plain u8
 /// wrapper instead of pulling in a bitflags dependency, this crate
 /// stays zero-dep on purpose.

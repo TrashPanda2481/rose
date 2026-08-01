@@ -201,11 +201,11 @@ extern "C" fn rose_exception_handler(frame: *mut InterruptFrame) {
         // this is an expected, frequent, non-error control transfer,
         // not something to run through the fatal-by-default handler.
         //
-        // Two families share this one vector: the legacy sentinel
+        // Three families share this one vector: the legacy sentinel
         // self-test (0xabcd1234, 1, predating any real ABI, no return
-        // value ever used) and the real CSpace syscalls. Routed by
-        // number, not by anything structural, since both arrive the
-        // same way (int 0x80).
+        // value ever used), the CSpace syscalls, and Retype. Routed by
+        // number, not by anything structural, since all three arrive
+        // the same way (int 0x80).
         if syscall::is_cspace_syscall(frame.regs.rax) {
             let num = frame.regs.rax;
             let arg1 = frame.regs.rdi;
@@ -218,6 +218,13 @@ extern "C" fn rose_exception_handler(frame: *mut InterruptFrame) {
             // pop rax from right before iretq, so this is what ring 3
             // actually sees land in its own rax after the int 0x80
             // returns.
+            frame.regs.rax = result;
+        } else if syscall::is_untyped_syscall(frame.regs.rax) {
+            let arg1 = frame.regs.rdi;
+            let arg2 = frame.regs.rsi;
+            let arg3 = frame.regs.rdx;
+            let result = syscall::dispatch_untyped(arg1, arg2, arg3);
+            usermode::on_untyped_syscall(arg1, arg2, arg3, result);
             frame.regs.rax = result;
         } else {
             usermode::on_syscall(frame.regs.rax);

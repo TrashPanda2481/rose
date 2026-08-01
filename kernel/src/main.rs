@@ -15,6 +15,7 @@ mod scheduler;
 mod serial;
 mod syscall;
 mod timer;
+mod untyped;
 mod usermode;
 
 use abi::{Capability, KernelObjectId, ObjectType, Rights};
@@ -477,6 +478,26 @@ fn usermode_selftest(com1: &mut serial::Serial) -> ! {
     };
     scheduler::with_current_cspace(|cspace| cspace.grant_root(1, root_cap))
         .expect("rose: usermode self-test: cspace grant_root failed");
+
+    // Same boot-handoff stand-in, extended for Retype: task 0's own
+    // CSpace slot 6 gets a root cap over a fresh 2-frame Untyped pool
+    // (untyped.rs), so the ring-3 program's four Retype steps (see
+    // usermode.rs) have something real to retype from instead of
+    // hitting InvalidUntyped against an empty slot 6. Two frames, not
+    // one: the sequence deliberately retypes twice successfully (a
+    // Frame and a CSpace) before a third retype is expected to hit
+    // Exhausted, so the pool has to run out exactly then, not sooner.
+    let untyped_object = untyped::UntypedObject::new(2)
+        .expect("rose: usermode self-test: out of memory (untyped pool)");
+    let untyped_id = untyped::register_untyped(untyped_object);
+    let untyped_cap = Capability {
+        object_ref: KernelObjectId(untyped_id),
+        object_type: ObjectType::Untyped,
+        rights: full_rights,
+        badge: 0,
+    };
+    scheduler::with_current_cspace(|cspace| cspace.grant_root(6, untyped_cap))
+        .expect("rose: usermode self-test: cspace grant_root (untyped) failed");
 
     let _ = writeln!(
         com1,
