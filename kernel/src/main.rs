@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+mod cspace;
 mod gdt;
 mod heap;
 mod idt;
@@ -15,6 +16,7 @@ mod serial;
 mod timer;
 mod usermode;
 
+use abi::{Capability, KernelObjectId, ObjectType, Rights};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -147,6 +149,8 @@ unsafe extern "C" fn kernel_main() -> ! {
     scheduler_selftest(&mut com1);
 
     scheduled_address_space_selftest(&mut com1);
+
+    cspace_selftest(&mut com1);
 
     usermode_selftest(&mut com1)
 }
@@ -640,6 +644,75 @@ fn scheduled_address_space_selftest(com1: &mut serial::Serial) {
         TASK_D_RESULT.load(Ordering::Relaxed),
         if b_ok { "match" } else { "MISMATCH" },
         if a_ok && b_ok { "confirmed" } else { "FAILED" }
+    );
+}
+
+/// Proves the derivation tree in cspace.rs actually works, not just
+/// that a single grant round-trips. Grants a root capability over the
+/// kernel's own AddressSpace (standing in for the real "Boot handoff"
+/// root grant until there's a real root task to receive it), copies
+/// it to a sibling slot, mints a narrowed-rights badged child into a
+/// third slot, then revokes the original and checks all three slots
+/// emptied out. No syscall involved; this calls cspace::CSpace's
+/// methods directly, see the module doc in cspace.rs for what's still
+/// missing before that's possible.
+fn cspace_selftest(com1: &mut serial::Serial) {
+    let mut cspace = cspace::CSpace::new();
+    let kernel_as = paging::kernel_address_space();
+    let full_rights = Rights::READ.union(Rights::WRITE).union(Rights::MAP);
+    let root_cap = Capability {
+        object_ref: KernelObjectId(kernel_as.raw()),
+        object_type: ObjectType::AddressSpace,
+        rights: full_rights,
+        badge: 0,
+    };
+
+    cspace
+        .grant_root(1, root_cap)
+        .expect("rose: cspace self-test: grant_root failed");
+    cspace
+        .copy(1, 2, full_rights)
+        .expect("rose: cspace self-test: copy failed");
+
+    // Re-home the copy from slot 2 to slot 4. Exercises move_slot's
+    // tree-repointing: slot 2 must go empty and slot 4 must still be
+    // tracked as a child of slot 1, so a later revoke(1) still reaches
+    // it under its new name.
+    cspace
+        .move_slot(2, 4)
+        .expect("rose: cspace self-test: move_slot failed");
+    let move_cleared_src = cspace.lookup(2).is_none();
+
+    let minted_rights = Rights::READ;
+    let minted_badge: u64 = 0xc0ffee;
+    cspace
+        .mint(1, 3, minted_rights, minted_badge)
+        .expect("rose: cspace self-test: mint failed");
+
+    let cap1 = cspace.lookup(1).expect("rose: cspace self-test: slot 1 missing before revoke");
+    let cap4 = cspace.lookup(4).expect("rose: cspace self-test: slot 4 missing before revoke");
+    let cap3 = cspace.lookup(3).expect("rose: cspace self-test: slot 3 missing before revoke");
+
+    let refs_match = cap1.object_ref == cap4.object_ref && cap4.object_ref == cap3.object_ref;
+    let mint_narrowed =
+        cap3.rights == minted_rights && cap3.badge == minted_badge && cap3.rights != cap1.rights;
+
+    cspace
+        .revoke(1)
+        .expect("rose: cspace self-test: revoke failed");
+
+    let all_cleared =
+        cspace.lookup(1).is_none() && cspace.lookup(3).is_none() && cspace.lookup(4).is_none();
+
+    let ok = move_cleared_src && refs_match && mint_narrowed && all_cleared;
+    let _ = writeln!(
+        com1,
+        "rose: cspace self-test: move cleared source slot {}, copy/mint object_ref {}, mint narrowed rights+badge {}, revoke cascade cleared moved+minted+root {}, overall {}",
+        if move_cleared_src { "ok" } else { "FAILED" },
+        if refs_match { "match" } else { "MISMATCH" },
+        if mint_narrowed { "ok" } else { "FAILED" },
+        if all_cleared { "ok" } else { "FAILED" },
+        if ok { "confirmed" } else { "FAILED" }
     );
 }
 
