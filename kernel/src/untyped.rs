@@ -11,14 +11,25 @@
 //     contiguous-region Untyped is boot handoff's job later, once boot
 //     handoff is real (see docs/TRANSITION.md, Phase 1), not this
 //     feature's.
-//   - Only Frame and CSpace are retypeable. AddressSpace/Thread/
+//   - Frame, CSpace, AddressSpace, and Thread are retypeable.
 //     PageTable/Endpoint/Notification/Reply/IrqHandler retyping are
 //     each their own future feature, added to `retype`'s match arm
-//     when that object type's turn comes.
-//   - CSpace retype charges one frame out of the pool as bookkeeping
-//     only; the actual CSpace struct still lives on the kernel heap
-//     via Box, not placed in that physical frame. Documented
-//     asymmetry, not silently dropped.
+//     when that object type's turn comes. PageTable specifically is a
+//     deliberate punt, not just "not implemented yet": paging.rs's
+//     AddressSpace::map_page already manages intermediate page-table
+//     levels internally, invisible to the capability model, and there's
+//     no current need (SMP, page-table sharing) to reason about a
+//     table level as its own object. Revisit when something actually
+//     needs that, not before.
+//   - CSpace and Thread retype each charge one frame out of the pool
+//     as bookkeeping only; the actual struct still lives on the kernel
+//     heap via Box (CSpace) or a module-local registry (Thread), not
+//     placed in that physical frame. Documented asymmetry, not
+//     silently dropped. AddressSpace retype also charges one
+//     bookkeeping frame from the pool on top of the real PML4 frame
+//     `paging::new_address_space` allocates separately from the global
+//     frame allocator; same asymmetry, extended consistently rather
+//     than given a special case.
 //   - Revoking a retyped cap kills the cap and its derivation subtree
 //     (cspace.rs's existing revoke, same mechanism every other cap
 //     already uses); it does not return frames to FRAME_ALLOCATOR or
@@ -28,9 +39,26 @@
 //   - Frame caps produced here don't do anything yet; nothing calls
 //     Map/Unmap on them. This proves a Frame cap can be minted from
 //     real memory and tracked, not that it's usable in paging yet.
+//   - A retyped Thread is a bare placeholder (`ThreadObject`, empty in
+//     v0.1): nothing configures it, gives it a stack/entry point, or
+//     makes it schedulable. It isn't wired into scheduler.rs's task
+//     list at all yet; that wiring, plus the suspend/resume state a
+//     Task needs before it's safe to add to the live round-robin
+//     queue, is the Thread.Configure/Resume/Suspend/SetPriority
+//     syscall feature's job, not this one's. This registry's index is
+//     therefore a placeholder identity, not yet the "task index" the
+//     abi crate's own KernelObjectId doc comment anticipates; that
+//     future feature is what has to reconcile the two, either by
+//     making them the same index space or by translating between them.
+//   - A retyped AddressSpace is real and immediately usable as far as
+//     paging.rs is concerned (it's the same `paging::AddressSpace` any
+//     other caller gets from `new_address_space`), but nothing maps
+//     anything into it here; it's an empty address space until some
+//     future Frame.Map syscall populates it.
 
 use crate::cspace::CSpace;
 use crate::mem::{self, SpinLock};
+use crate::paging;
 use abi::ObjectType;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -87,7 +115,9 @@ pub enum UntypedError {
     InvalidUntyped,
     /// Pool has no frames left at the requested watermark.
     Exhausted,
-    /// `object_type` isn't Frame or CSpace in v0.1.
+    /// `object_type` isn't one of the retypeable types listed in this
+    /// module's own doc comment (Frame, CSpace, AddressSpace, Thread
+    /// as of this feature).
     UnsupportedType,
 }
 
@@ -117,6 +147,20 @@ static UNTYPED_OBJECTS: SpinLock<Vec<Option<UntypedObject>>> = SpinLock::new(Vec
 /// per-ObjectType, not global, per abi's own doc comment on it.
 static CSPACE_OBJECTS: SpinLock<Vec<Option<Box<CSpace>>>> = SpinLock::new(Vec::new());
 
+/// A retyped-but-unconfigured Thread. Deliberately empty in v0.1: see
+/// this module's own doc comment for why (no scheduler wiring, no
+/// suspend/resume state, that's the Configure/Resume/Suspend/
+/// SetPriority syscall feature's job). Exists as its own type rather
+/// than a bare `()` placeholder so it has somewhere to grow into once
+/// that feature lands, same spirit as every other "prove it once,
+/// harden later" type in this codebase.
+pub struct ThreadObject;
+
+/// Global registry of Thread placeholders created by Retype. Separate
+/// counter/namespace from UNTYPED_OBJECTS and CSPACE_OBJECTS, same
+/// per-ObjectType KernelObjectId reasoning as CSPACE_OBJECTS above.
+static THREAD_OBJECTS: SpinLock<Vec<Option<ThreadObject>>> = SpinLock::new(Vec::new());
+
 /// Adds `object` to the registry and returns the id to use as its
 /// Capability's KernelObjectId. Called from boot handoff (main.rs)
 /// today, standing in for the real root task's Untyped grant until
@@ -133,15 +177,32 @@ fn register_cspace(cspace: Box<CSpace>) -> u64 {
     (objects.len() - 1) as u64
 }
 
+fn register_thread(thread: ThreadObject) -> u64 {
+    let mut objects = THREAD_OBJECTS.lock();
+    objects.push(Some(thread));
+    (objects.len() - 1) as u64
+}
+
 /// Retypes one frame out of the Untyped object at `untyped_id` into
-/// `object_type`, returning the new object's KernelObjectId (the
-/// frame's own physical address for Frame, a CSPACE_OBJECTS registry
-/// index for CSpace). Doesn't touch any CSpace slot directly; the
-/// caller (syscall.rs's `dispatch_untyped`) is responsible for
-/// installing the resulting Capability as a child of the Untyped cap,
-/// same derivation-tree pattern copy/mint already use.
+/// `object_type`, returning the new object's KernelObjectId:
+///   - Frame: the frame's own physical address.
+///   - CSpace: a CSPACE_OBJECTS registry index.
+///   - AddressSpace: the freshly built AddressSpace's own PML4
+///     physical address (`paging::AddressSpace::raw()`), same "reuse
+///     an existing stable identity" pattern as Frame, not a registry
+///     index.
+///   - Thread: a THREAD_OBJECTS registry index. Placeholder identity
+///     only; see this module's own doc comment on why it isn't yet
+///     the real scheduler task index.
+/// Doesn't touch any CSpace slot directly; the caller (syscall.rs's
+/// `dispatch_untyped`) is responsible for installing the resulting
+/// Capability as a child of the Untyped cap, same derivation-tree
+/// pattern copy/mint already use.
 pub fn retype(untyped_id: u64, object_type: ObjectType) -> Result<u64, UntypedError> {
-    if !matches!(object_type, ObjectType::Frame | ObjectType::CSpace) {
+    if !matches!(
+        object_type,
+        ObjectType::Frame | ObjectType::CSpace | ObjectType::AddressSpace | ObjectType::Thread
+    ) {
         return Err(UntypedError::UnsupportedType);
     }
 
@@ -158,6 +219,15 @@ pub fn retype(untyped_id: u64, object_type: ObjectType) -> Result<u64, UntypedEr
     match object_type {
         ObjectType::Frame => Ok(phys),
         ObjectType::CSpace => Ok(register_cspace(Box::new(CSpace::new()))),
+        // `phys` above was only a bookkeeping charge against the pool
+        // (see module doc); the real PML4 frame comes from
+        // `new_address_space`'s own call into the global frame
+        // allocator, a second, separate frame. `init()` (paging.rs)
+        // must have already run by the time any Untyped pool exists
+        // for a caller to retype from, so this unsafe contract is
+        // always satisfied here.
+        ObjectType::AddressSpace => Ok(unsafe { paging::new_address_space() }.raw()),
+        ObjectType::Thread => Ok(register_thread(ThreadObject)),
         _ => unreachable!("checked above"),
     }
 }

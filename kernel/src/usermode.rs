@@ -51,14 +51,16 @@ use crate::syscall::{
 //   4. COPY   slot1 -> slot3 (already occupied by the mint)    -> DestOccupied
 //   5. REVOKE slot1 (cascades: clears slot3 and slot4)          -> 0 (ok)
 //   6. COPY   slot1 -> slot5 (slot1 just revoked, now empty)    -> SourceEmpty
-// Extended past the six CSpace steps with a fixed four-step Retype
-// sequence, against slot6 (a root Untyped cap over a 2-frame pool,
+// Extended past the six CSpace steps with a fixed six-step Retype
+// sequence, against slot6 (a root Untyped cap over a 4-frame pool,
 // see main.rs's usermode_selftest). Cross-checked against
 // on_untyped_syscall's UNTYPED_SYSCALL_STEPS table below:
-//   7.  RETYPE slot6 -> slot7,  Frame  (1)                      -> ok
-//   8.  RETYPE slot6 -> slot8,  CSpace (9)                      -> ok
-//   9.  RETYPE slot6 -> slot9,  Frame  (1) (pool now empty)     -> Exhausted
-//   10. RETYPE slot6 -> slot10, Thread (4) (not retypeable)     -> UnsupportedType
+//   7.  RETYPE slot6 -> slot7,  Frame        (1)                 -> ok
+//   8.  RETYPE slot6 -> slot8,  CSpace       (9)                 -> ok
+//   9.  RETYPE slot6 -> slot9,  AddressSpace (3)                 -> ok
+//   10. RETYPE slot6 -> slot10, Thread       (4) (pool now empty) -> ok
+//   11. RETYPE slot6 -> slot11, Frame        (1) (pool empty)     -> Exhausted
+//   12. RETYPE slot6 -> slot12, PageTable    (2) (not retypeable) -> UnsupportedType
 core::arch::global_asm!(
     ".section .rodata.user_program, \"a\"",
     ".global user_program_start",
@@ -114,17 +116,31 @@ core::arch::global_asm!(
     "mov rdx, 8",
     "mov rax, 0x1004",
     "int 0x80",
-    // 9: RETYPE slot6 -> slot9, Frame (1), expect Exhausted (pool of
-    // 2 frames already spent by steps 7 and 8)
+    // 9: RETYPE slot6 -> slot9, AddressSpace (3), expect ok
     "mov rdi, 6",
-    "mov rsi, 1",
+    "mov rsi, 3",
     "mov rdx, 9",
     "mov rax, 0x1004",
     "int 0x80",
-    // 10: RETYPE slot6 -> slot10, Thread (4), expect UnsupportedType
+    // 10: RETYPE slot6 -> slot10, Thread (4), expect ok (pool of 4
+    // frames now fully spent by steps 7 through 10)
     "mov rdi, 6",
     "mov rsi, 4",
     "mov rdx, 10",
+    "mov rax, 0x1004",
+    "int 0x80",
+    // 11: RETYPE slot6 -> slot11, Frame (1), expect Exhausted (pool
+    // already spent by steps 7 through 10)
+    "mov rdi, 6",
+    "mov rsi, 1",
+    "mov rdx, 11",
+    "mov rax, 0x1004",
+    "int 0x80",
+    // 12: RETYPE slot6 -> slot12, PageTable (2), expect UnsupportedType
+    // (deliberately not retypeable, see untyped.rs module doc)
+    "mov rdi, 6",
+    "mov rsi, 2",
+    "mov rdx, 12",
     "mov rax, 0x1004",
     "int 0x80",
     "2:",
@@ -272,24 +288,29 @@ enum ExpectedOutcome {
 static UNTYPED_SYSCALL_STEP: AtomicU64 = AtomicU64::new(0);
 static UNTYPED_SYSCALL_ALL_OK: AtomicBool = AtomicBool::new(true);
 
-/// One row per syscall in the fixed four-step Retype sequence
+/// One row per syscall in the fixed six-step Retype sequence
 /// appended to the ring-3 program above, run immediately after the
 /// six CSpace steps; index must line up with call order exactly.
-const UNTYPED_SYSCALL_STEPS: [(&str, ExpectedOutcome); 4] = [
+const UNTYPED_SYSCALL_STEPS: [(&str, ExpectedOutcome); 6] = [
     ("retype slot6->slot7 Frame", ExpectedOutcome::Success),
     ("retype slot6->slot8 CSpace", ExpectedOutcome::Success),
+    ("retype slot6->slot9 AddressSpace", ExpectedOutcome::Success),
     (
-        "retype slot6->slot9 Frame (pool exhausted)",
+        "retype slot6->slot10 Thread (pool now empty)",
+        ExpectedOutcome::Success,
+    ),
+    (
+        "retype slot6->slot11 Frame (pool exhausted)",
         ExpectedOutcome::Error((-12i64) as u64),
     ),
     (
-        "retype slot6->slot10 Thread (unsupported type)",
+        "retype slot6->slot12 PageTable (unsupported type, deliberate punt)",
         ExpectedOutcome::Error((-13i64) as u64),
     ),
 ];
 
 /// Called from idt.rs's rose_exception_handler for every `int 0x80`
-/// carrying the Retype syscall number. Verifies each of the four
+/// carrying the Retype syscall number. Verifies each of the six
 /// against UNTYPED_SYSCALL_STEPS in order and, once the last one
 /// lands, prints the aggregated verdict and halts for good. This is
 /// now the true final halt for the whole boot self-test chain (see
