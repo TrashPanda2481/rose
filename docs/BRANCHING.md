@@ -17,6 +17,7 @@ Track every main → stable merge here. Newest first.
 ```
 Date        Commit      What it proves works
 ----        ------      ---------------------
+2026-08-08  a7750e9     PCI enumeration v0.1, Frame-Map syscall (fixes Configure page-fault bug), and per-task kernel entry stacks (fixes post-syscall page-fault bug), verified end to end on QEMU (BIOS+UEFI) and Oracle VM VirtualBox.
 2026-08-01  44903de     Retype extended to AddressSpace and Thread (six-step ring-3 self-test), verified end to end on QEMU (BIOS) and Oracle VM VirtualBox.
 2026-08-01  93a2fc5     Capabilities/CSpace v0.1, CSpace syscalls, Untyped/Retype v0.1, and the task 0 address-space sync fix, verified end to end on QEMU (BIOS+UEFI) and Oracle VM VirtualBox.
 2026-07-25  cd93663     PIC remap + PIT timer (IRQ0 on vector 32). Timer self-test timeout bug fixed. VirtualBox boot confirms hardware IRQ0 delivery works outside this dev sandbox's QEMU/TCG.
