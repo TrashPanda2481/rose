@@ -146,6 +146,14 @@ Update: the spec above describes the eventual per-priority model; v0.1 code (`ke
 
 Known gap, not solved by Configure: `gdt::set_kernel_stack` (TSS.RSP0) is a single global value, set once before the first ring3->ring0 trap and never updated per-task. Fine as long as only one ring-3 thread is ever mid-trap at a time, true today since there's no real concurrency (single core, cooperative-plus-timer-tick scheduling, no syscall reentrancy). Stops being fine the moment two ring-3 threads could both be trapping concurrently; a real fix needs a per-task kernel stack and a TSS.RSP0 reload on every switch-in, not just at boot. Not needed yet, since Configure only proves a *second* task can exist and run, not that two can trap at once.
 
+## Design principle: verify before commit
+
+A standing rule for kernel code, not a single feature: nothing acts on unconfirmed information. Every place the kernel is about to commit state based on something it hasn't checked yet gets a read-only verification step first, and only proceeds once that check passes. Unconfirmed data is treated as untrusted by default, not optimistically assumed correct.
+
+The pattern already exists in the Configure syscall (`kernel/src/thread.rs`): `peek_thread_unconfigured` reads a thread's state without changing anything, and only `claim_thread` is allowed to actually commit it, and only after the peek confirms the thread is in the expected state. PCI enumeration (`kernel/src/pci.rs`) follows the same shape at the hardware level: a slot's vendor id is read first, and every other register on that slot is only read once the vendor id confirms something is actually there. Nothing about a bus, a device, or a thread is assumed true because it seemed likely; it's read, checked, and only then acted on.
+
+This is the rule any future syscall or hardware-facing code should be held against: find the point where the code is about to trust something it hasn't verified, and put the read-only check before the commit, not after.
+
 ## Open questions (blocking nothing yet, but need answers before code locks in)
 
 1. Revocation: full cascade vs. sealed caps.

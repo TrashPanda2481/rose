@@ -2,6 +2,11 @@
 
 Format: date, what changed, why. Newest first.
 
+## 2026-08-08
+
+- Kernel design principle written down: verify before commit. Codifies the pattern already used by Configure (check a thread's state before claiming it) as a standing rule for future syscalls and hardware-facing code, nothing acts on unconfirmed information. Documentation only, no code change.
+- PCI enumeration added: the kernel can now walk the PCI bus and read what a device publishes about itself, vendor id, device id, class code, subclass, programming interface, through the same legacy I/O ports every PC-compatible x86 machine has supported since the original PCI spec. Read-only, no device is ever sent a command, and every slot's vendor id is checked before anything else about it is read, the same verify-before-commit shape as the new design principle above. This is the first piece of the hardware detection model discussed for letting Rose recognize standardized, self-describing hardware without needing vendor-specific drivers; PCI's class/subclass/prog-if codes are the first of those self-describing mechanisms to actually get read. Zero build warnings. Verified on QEMU BIOS and UEFI: correctly enumerates QEMU's own standard i440FX chipset devices (host bridge, ISA bridge, IDE, ACPI/PM, VGA, e1000 NIC), identical result both boot paths. Not yet run in Oracle VM VirtualBox.
+
 ## 2026-08-01
 
 - Task 0 address-space sync fix added: task 0's own scheduler bookkeeping now stays in sync when the usermode self-test manually switches into a second AddressSpace before dropping to ring 3. Before this, that switch changed CR3 but never told the scheduler, so the next real timer preemption that cycled back to task 0 reloaded CR3 from a stale field instead, reverting to the kernel's own AddressSpace mid ring-3-program. This is what caused the page fault crash logged below in the Untyped/Retype entry's Oracle VM VirtualBox run. Zero build warnings. Verified on QEMU BIOS+UEFI, no regression in the existing ten-step self-test. QEMU never delivers real hardware timer interrupts in this sandbox, so this fix couldn't be exercised for real preemption there. Confirmed in Oracle VM VirtualBox: full ten-step self-test now passes clean end to end with real hardware timer ticks interleaved throughout, no fault. Promoted to `stable`.

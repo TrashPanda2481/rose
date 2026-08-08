@@ -10,6 +10,7 @@ mod heap;
 mod idt;
 mod mem;
 mod paging;
+mod pci;
 mod pic;
 mod scheduler;
 mod serial;
@@ -154,6 +155,8 @@ unsafe extern "C" fn kernel_main() -> ! {
     scheduled_address_space_selftest(&mut com1);
 
     cspace_selftest(&mut com1);
+
+    pci_selftest(&mut com1);
 
     usermode_selftest(&mut com1)
 }
@@ -808,6 +811,33 @@ fn cspace_selftest(com1: &mut serial::Serial) {
         if all_cleared { "ok" } else { "FAILED" },
         if ok { "confirmed" } else { "FAILED" }
     );
+}
+
+/// Walks the PCI bus via the legacy config mechanism and logs every
+/// function that reports a real vendor id. No expected device list to
+/// check against, the point is discovery itself; QEMU's own standard
+/// virtual devices (host bridge, ISA bridge, etc.) show up here as
+/// ordinary log lines like anything else found.
+fn pci_selftest(com1: &mut serial::Serial) {
+    let _ = writeln!(com1, "rose: pci self-test: enumerating");
+    let mut count: u32 = 0;
+    pci::enumerate(|dev| {
+        count += 1;
+        let _ = writeln!(
+            com1,
+            "rose: pci: {:02x}:{:02x}.{} vendor={:04x} device={:04x} class={:02x} subclass={:02x} progif={:02x} rev={:02x}",
+            dev.bus,
+            dev.device,
+            dev.function,
+            dev.vendor_id,
+            dev.device_id,
+            dev.class_code,
+            dev.subclass,
+            dev.prog_if,
+            dev.revision_id
+        );
+    });
+    let _ = writeln!(com1, "rose: pci self-test: {} device(s) found", count);
 }
 
 fn frame_allocator_selftest(com1: &mut serial::Serial) {
