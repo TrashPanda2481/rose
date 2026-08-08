@@ -14,6 +14,7 @@ mod pic;
 mod scheduler;
 mod serial;
 mod syscall;
+mod thread;
 mod timer;
 mod untyped;
 mod usermode;
@@ -416,6 +417,19 @@ fn usermode_selftest(com1: &mut serial::Serial) -> ! {
     // nothing already mapped up here could collide).
     const CODE_VADDR: u64 = 0x0000_0000_0040_0000;
     const STACK_VADDR: u64 = 0x0000_0000_0060_0000;
+    // Second program's own code/stack pages (see usermode.rs's
+    // program2_bytes and the ring-3 program's step 13). Mapped into
+    // the SAME user_as below, not a separate AddressSpace: step 13's
+    // Configure syscall targets slot9, which is user_as itself
+    // (retyped in step 9), so whatever it launches has to already be
+    // mapped there ahead of time, same "kernel-side synthesizes the
+    // whole ring-3 environment up front" pattern as CODE_VADDR/
+    // STACK_VADDR above, just for a second program instead of the
+    // first. Values are hardcoded to match the literal immediates in
+    // usermode.rs's step 13 asm (mov r10, 0x800000 / mov r8,
+    // 0xa01000); if either changes, the other has to change with it.
+    const CODE2_VADDR: u64 = 0x0000_0000_0080_0000;
+    const STACK2_VADDR: u64 = 0x0000_0000_00A0_0000;
 
     // A real second AddressSpace now, not the kernel's currently-active
     // one (see address_space_selftest above, first thing to exercise
@@ -455,6 +469,39 @@ fn usermode_selftest(com1: &mut serial::Serial) -> ! {
         );
     }
     let user_stack_top = STACK_VADDR + mem::FRAME_SIZE;
+
+    // Second program's code page, same R+X+U/no-writable reasoning as
+    // the first program's own code_phys mapping above.
+    let code2_phys = mem::FRAME_ALLOCATOR
+        .lock()
+        .alloc()
+        .expect("rose: usermode self-test: out of memory (code2)");
+    unsafe {
+        user_as.map_page(CODE2_VADDR, code2_phys, paging::PAGE_USER);
+    }
+    let program2 = usermode::program2_bytes();
+    unsafe {
+        let code2_virt = paging::phys_to_virt(code2_phys) as *mut u8;
+        core::ptr::copy_nonoverlapping(program2.as_ptr(), code2_virt, program2.len());
+    }
+
+    // Second program's stack page, same R+W+U+NX reasoning as the
+    // first program's own stack_phys mapping above.
+    let stack2_phys = mem::FRAME_ALLOCATOR
+        .lock()
+        .alloc()
+        .expect("rose: usermode self-test: out of memory (stack2)");
+    unsafe {
+        user_as.map_page(
+            STACK2_VADDR,
+            stack2_phys,
+            paging::PAGE_USER | paging::PAGE_WRITABLE | paging::PAGE_NO_EXECUTE,
+        );
+    }
+    // STACK2_VADDR + FRAME_SIZE = 0xa01000, matching the literal
+    // stack_top immediate (mov r8, 0xa01000) in usermode.rs's step 13
+    // asm; no separate variable here since nothing in this fn passes
+    // it anywhere, unlike user_stack_top above.
 
     unsafe {
         let scratch_top =

@@ -12,16 +12,20 @@
 // value in rax on exit: 0 or positive means success, negative means
 // an error whose magnitude is the CSpaceError code.
 
-use crate::cspace::CSpaceError;
+use crate::cspace::{CSpace, CSpaceError};
+use crate::paging;
 use crate::scheduler;
+use crate::thread::{self, ConfigureError};
 use crate::untyped::{self, UntypedError};
 use abi::{Capability, KernelObjectId, ObjectType, Rights};
+use alloc::boxed::Box;
 
 pub const SYS_CSPACE_COPY: u64 = 0x1000;
 pub const SYS_CSPACE_MINT: u64 = 0x1001;
 pub const SYS_CSPACE_MOVE: u64 = 0x1002;
 pub const SYS_CSPACE_REVOKE: u64 = 0x1003;
 pub const SYS_UNTYPED_RETYPE: u64 = 0x1004;
+pub const SYS_THREAD_CONFIGURE: u64 = 0x1005;
 
 /// True if `num` is one of the syscall numbers this module handles.
 /// idt.rs uses this to route between the new CSpace path and the
@@ -41,6 +45,15 @@ pub fn is_cspace_syscall(num: u64) -> bool {
 /// which the CSpace-only `encode` above has no way to represent.
 pub fn is_untyped_syscall(num: u64) -> bool {
     num == SYS_UNTYPED_RETYPE
+}
+
+/// True if `num` is the Configure syscall. Own predicate/dispatch pair,
+/// same reasoning as `is_untyped_syscall` above: Configure's own
+/// ConfigureError is a third, unrelated error enum, and its success
+/// value (a scheduler task index) has nothing to do with either
+/// CSpaceError's or UntypedError's own encoding.
+pub fn is_configure_syscall(num: u64) -> bool {
+    num == SYS_THREAD_CONFIGURE
 }
 
 /// Maps a CSpace op's Result onto the single-register return
@@ -179,4 +192,82 @@ pub fn dispatch_untyped(arg1: u64, arg2: u64, arg3: u64) -> u64 {
     });
 
     encode_untyped(result)
+}
+
+/// Maps a Configure Result onto the single-register return convention:
+/// 0 or positive is success, carrying the new task's scheduler index.
+/// Negative means failure; ConfigureError codes are offset by +20
+/// (21-24) so they never collide with CSpaceError's 1-4 or
+/// UntypedError's 11-13 in the one shared register, same banding
+/// convention as `encode_untyped`'s own +10 offset for UntypedError.
+fn encode_configure(result: Result<usize, ConfigureError>) -> u64 {
+    match result {
+        Ok(idx) => idx as u64,
+        Err(e) => (-(e.code() as i64 + 20)) as u64,
+    }
+}
+
+/// Runs Configure against the calling task's own CSpace. Argument
+/// meaning: arg1=thread cptr, arg2=AddressSpace cptr, arg3=CSpace
+/// cptr (0 means "none, build a fresh empty CSpace instead"),
+/// arg4=entry, arg5=stack_top.
+///
+/// Two-phase, same reasoning as `dispatch_untyped`'s ordering comment:
+/// every cap lookup/rights check happens first, inside a single
+/// `with_current_cspace` call, and only once all three cptrs resolve
+/// does this call out to `thread::configure` (outside that closure).
+/// This isn't just style: `thread::configure` calls
+/// `scheduler::spawn_user`, which takes the same SCHEDULER lock
+/// `with_current_cspace` is already holding for the duration of its
+/// own closure; calling it from inside that closure would be a
+/// self-deadlock against a non-reentrant spinlock, not just untidy
+/// nesting.
+pub fn dispatch_configure(arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> u64 {
+    let thread_cptr = arg1 as u32;
+    let as_cptr = arg2 as u32;
+    let cspace_cptr = arg3 as u32;
+
+    let prepared = scheduler::with_current_cspace(
+        |cspace| -> Result<(u64, paging::AddressSpace, Option<Box<CSpace>>), ConfigureError> {
+            let thread_cap = cspace
+                .lookup(thread_cptr)
+                .filter(|cap| {
+                    cap.object_type == ObjectType::Thread && cap.rights.contains(Rights::GRANT)
+                })
+                .ok_or(ConfigureError::InvalidThread)?;
+
+            let as_cap = cspace
+                .lookup(as_cptr)
+                .filter(|cap| {
+                    cap.object_type == ObjectType::AddressSpace
+                        && cap.rights.contains(Rights::MAP)
+                })
+                .ok_or(ConfigureError::InvalidAddressSpace)?;
+
+            let cspace_box = if cspace_cptr == 0 {
+                None
+            } else {
+                let cs_cap = cspace
+                    .lookup(cspace_cptr)
+                    .filter(|cap| {
+                        cap.object_type == ObjectType::CSpace
+                            && cap.rights.contains(Rights::GRANT)
+                    })
+                    .ok_or(ConfigureError::InvalidCSpace)?;
+                Some(
+                    untyped::take_cspace(cs_cap.object_ref.0)
+                        .ok_or(ConfigureError::InvalidCSpace)?,
+                )
+            };
+
+            let address_space = paging::AddressSpace::from_raw(as_cap.object_ref.0);
+            Ok((thread_cap.object_ref.0, address_space, cspace_box))
+        },
+    );
+
+    let result = prepared.and_then(|(thread_id, address_space, cspace_box)| {
+        thread::configure(thread_id, address_space, cspace_box, arg4, arg5)
+    });
+
+    encode_configure(result)
 }

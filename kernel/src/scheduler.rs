@@ -28,6 +28,7 @@
 // under real preemption, not just a single manual switch.
 
 use crate::cspace::CSpace;
+use crate::gdt;
 use crate::mem::SpinLock;
 use crate::paging::{self, AddressSpace};
 use alloc::boxed::Box;
@@ -50,12 +51,16 @@ struct Task {
     // defaults to the kernel's, `spawn_in` picks any. Copy type (a
     // PML4 physical address), cheap to hold by value.
     address_space: AddressSpace,
-    // Every task gets its own empty CSpace at creation. Nothing is
+    // Every task gets its own CSpace at creation. Nothing is
     // reachable through a syscall until something (boot handoff today,
     // a parent task later) explicitly grants a root capability into
     // it; see cspace.rs's own doc comment ("if it's not in your
-    // CSpace, it doesn't exist for you").
-    cspace: CSpace,
+    // CSpace, it doesn't exist for you"). Boxed rather than inline:
+    // `spawn_user` takes ownership of a caller-supplied CSpace
+    // (thread::configure, via untyped::take_cspace) rather than always
+    // building a fresh one, and a Box is what lets that already-boxed
+    // object move straight in without an extra copy.
+    cspace: Box<CSpace>,
 }
 
 struct Scheduler {
@@ -81,7 +86,7 @@ pub unsafe fn init() {
         saved_rsp: 0,
         _stack: None,
         address_space: paging::kernel_address_space(),
-        cspace: CSpace::new(),
+        cspace: Box::new(CSpace::new()),
     });
     scheduler.current = 0;
     scheduler.ticks_left = TIMESLICE_TICKS;
@@ -154,7 +159,60 @@ pub fn spawn_in(entry: fn(), address_space: AddressSpace) -> usize {
         saved_rsp: sp,
         _stack: Some(stack),
         address_space,
-        cspace: CSpace::new(),
+        cspace: Box::new(CSpace::new()),
+    });
+    scheduler.tasks.len() - 1
+}
+
+/// Builds a brand-new task that lands directly in ring 3 on its first
+/// run, instead of `spawn_in`'s ring-0 `entry: fn()`. Used exclusively
+/// by `thread::configure`: a Configure syscall supplies its own
+/// `address_space` (already mapped with whatever the caller wants
+/// `entry`/`user_stack_top` to point at) and `cspace` (either a fresh
+/// one thread::configure built, or one taken from a caller-supplied
+/// CSpace cap via `untyped::take_cspace`), and this just wires those
+/// into a schedulable Task the same way `spawn_in` does for a kernel
+/// task.
+///
+/// Same fabricated-frame trick as `spawn_in`, with two changes: the
+/// return address is `user_task_trampoline` instead of
+/// `task_trampoline`, and the rbp slot (always 0 in `spawn_in`'s
+/// frame, since a ring-0 `fn()` entry takes no arguments) carries
+/// `user_stack_top` instead. `user_task_trampoline` reads `entry` out
+/// of rbx (same convention as `task_trampoline`) and `user_stack_top`
+/// out of rbp, then builds the iretq frame from those plus the fixed
+/// ring-3 GDT selectors.
+pub fn spawn_user(
+    entry: u64,
+    user_stack_top: u64,
+    address_space: AddressSpace,
+    cspace: Box<CSpace>,
+) -> usize {
+    let mut stack: Box<[u8]> = alloc::vec![0u8; STACK_SIZE].into_boxed_slice();
+    let stack_top = stack.as_mut_ptr() as u64 + STACK_SIZE as u64;
+    let frame = [
+        user_task_trampoline as *const () as u64,
+        entry,
+        user_stack_top, // rbp slot, repurposed; see doc comment above
+        0u64,           // r12
+        0u64,           // r13
+        0u64,           // r14
+        0u64,           // r15
+    ];
+    let mut sp = stack_top;
+    for value in frame.iter() {
+        sp -= 8;
+        unsafe {
+            (sp as *mut u64).write(*value);
+        }
+    }
+
+    let mut scheduler = SCHEDULER.lock();
+    scheduler.tasks.push(Task {
+        saved_rsp: sp,
+        _stack: Some(stack),
+        address_space,
+        cspace,
     });
     scheduler.tasks.len() - 1
 }
@@ -362,5 +420,33 @@ extern "C" fn task_trampoline() -> ! {
         "2:",
         "hlt",
         "jmp 2b",
+    )
+}
+
+/// Landing pad for a Configure-spawned task's very first run, same
+/// reasoning as `task_trampoline` (reached via context_switch's `ret`
+/// on first run, never through iretq or yield_now's own sti, so `sti`
+/// has to come first here too) but dropping straight into ring 3
+/// instead of calling a ring-0 fn. Replicates `enter_user_mode`'s
+/// exact push order (SS, RSP, RFLAGS, CS, RIP, so RIP ends up topmost
+/// per iretq's own pop order) by hand, since a naked fn can't call
+/// into a normal `unsafe fn` mid-asm: `entry` (RIP) comes in via rbx
+/// and `user_stack_top` (RSP) via rbp, exactly as `spawn_user`'s
+/// fabricated frame laid them out; SS/CS/RFLAGS are the same fixed
+/// ring-3 values `enter_user_mode` uses, embedded as naked_asm consts
+/// since there's no register budget left to spare for them here.
+#[unsafe(naked)]
+extern "C" fn user_task_trampoline() -> ! {
+    core::arch::naked_asm!(
+        "sti",
+        "push {user_ss}",
+        "push rbp",
+        "push {rflags}",
+        "push {user_cs}",
+        "push rbx",
+        "iretq",
+        user_ss = const gdt::USER_DATA_SELECTOR as u64,
+        rflags = const 0x202u64,
+        user_cs = const gdt::USER_CODE_SELECTOR as u64,
     )
 }

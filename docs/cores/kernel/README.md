@@ -142,6 +142,10 @@ This is the only place authority comes from nothing. Every other capability in t
 - Preempt on timer tick or on block (Receive/Call/Wait with nothing to do).
 - No starvation handling. A saturated high-priority thread can starve everyone below it. Known gap, not fixing yet: IPC correctness comes first.
 
+Update: the spec above describes the eventual per-priority model; v0.1 code (`kernel/src/scheduler.rs`) is flatter than that, one round-robin queue, no priority field on `Task` at all yet. `scheduler::spawn_user` (Configure syscall, `kernel/src/thread.rs`) is the first way to get a task into that queue starting in ring 3 rather than ring 0; it takes an already-built `AddressSpace` and `CSpace` rather than building its own, both supplied by whoever calls Configure. Priority is deliberately not a Configure argument, since there's still no field to set it on; a future `SetPriority` syscall is what actually needs to exist before priority becomes real, not this one.
+
+Known gap, not solved by Configure: `gdt::set_kernel_stack` (TSS.RSP0) is a single global value, set once before the first ring3->ring0 trap and never updated per-task. Fine as long as only one ring-3 thread is ever mid-trap at a time, true today since there's no real concurrency (single core, cooperative-plus-timer-tick scheduling, no syscall reentrancy). Stops being fine the moment two ring-3 threads could both be trapping concurrently; a real fix needs a per-task kernel stack and a TSS.RSP0 reload on every switch-in, not just at boot. Not needed yet, since Configure only proves a *second* task can exist and run, not that two can trap at once.
+
 ## Open questions (blocking nothing yet, but need answers before code locks in)
 
 1. Revocation: full cascade vs. sealed caps.
