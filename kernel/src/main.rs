@@ -421,18 +421,19 @@ fn usermode_selftest(com1: &mut serial::Serial) -> ! {
     const CODE_VADDR: u64 = 0x0000_0000_0040_0000;
     const STACK_VADDR: u64 = 0x0000_0000_0060_0000;
     // Second program's own code/stack pages (see usermode.rs's
-    // program2_bytes and the ring-3 program's step 13). Mapped into
-    // the SAME user_as below, not a separate AddressSpace: step 13's
-    // Configure syscall targets slot9, which is user_as itself
-    // (retyped in step 9), so whatever it launches has to already be
-    // mapped there ahead of time, same "kernel-side synthesizes the
-    // whole ring-3 environment up front" pattern as CODE_VADDR/
-    // STACK_VADDR above, just for a second program instead of the
-    // first. Values are hardcoded to match the literal immediates in
-    // usermode.rs's step 13 asm (mov r10, 0x800000 / mov r8,
-    // 0xa01000); if either changes, the other has to change with it.
-    const CODE2_VADDR: u64 = 0x0000_0000_0080_0000;
-    const STACK2_VADDR: u64 = 0x0000_0000_00A0_0000;
+    // program2_bytes and the ring-3 program's step 15 Configure) go
+    // at 0x800000 (CODE2_VADDR) and 0xa00000 (STACK2_VADDR). No local
+    // consts for these anymore, unlike CODE_VADDR/STACK_VADDR above:
+    // neither address is ever passed to a map_page call in this fn
+    // now (that was the bug, see BUGS.md's "Configure-spawned second
+    // task page-faults" entry) since real mappings into slot9 happen
+    // via the ring-3 program's own Map syscalls (steps 10/11) against
+    // capabilities this fn grants below (slot7's retyped Frame for
+    // the stack, slot13's pre-populated Frame for the code); a local
+    // const with no reader would just be dead code. The two literal
+    // addresses are hardcoded to match usermode.rs's Map/Configure asm
+    // immediates (mov rdx, 0x800000 / mov rdx, 0xa00000 / mov r8,
+    // 0xa01000); if any changes, the others have to change with it.
 
     // A real second AddressSpace now, not the kernel's currently-active
     // one (see address_space_selftest above, first thing to exercise
@@ -473,38 +474,31 @@ fn usermode_selftest(com1: &mut serial::Serial) -> ! {
     }
     let user_stack_top = STACK_VADDR + mem::FRAME_SIZE;
 
-    // Second program's code page, same R+X+U/no-writable reasoning as
-    // the first program's own code_phys mapping above.
+    // Second program's code page. Not mapped here anymore (that was
+    // the bug); instead allocated and pre-populated with the real
+    // instruction bytes at ring-0 setup time (ring 3 has no way to
+    // write frame contents via syscalls), then granted below as a
+    // root Frame capability into slot13. The ring-3 program's own
+    // step 11 Map syscall is what actually puts it into slot9 at
+    // CODE2_VADDR.
     let code2_phys = mem::FRAME_ALLOCATOR
         .lock()
         .alloc()
         .expect("rose: usermode self-test: out of memory (code2)");
-    unsafe {
-        user_as.map_page(CODE2_VADDR, code2_phys, paging::PAGE_USER);
-    }
     let program2 = usermode::program2_bytes();
     unsafe {
         let code2_virt = paging::phys_to_virt(code2_phys) as *mut u8;
         core::ptr::copy_nonoverlapping(program2.as_ptr(), code2_virt, program2.len());
     }
-
-    // Second program's stack page, same R+W+U+NX reasoning as the
-    // first program's own stack_phys mapping above.
-    let stack2_phys = mem::FRAME_ALLOCATOR
-        .lock()
-        .alloc()
-        .expect("rose: usermode self-test: out of memory (stack2)");
-    unsafe {
-        user_as.map_page(
-            STACK2_VADDR,
-            stack2_phys,
-            paging::PAGE_USER | paging::PAGE_WRITABLE | paging::PAGE_NO_EXECUTE,
-        );
-    }
+    // Second program's stack page comes from neither a kernel-
+    // preallocated frame nor a direct map_page call anymore: it
+    // reuses the Frame already retyped into slot7 by the ring-3
+    // program's own step 7, mapped into slot9 by step 10's Map
+    // syscall. Nothing else here needs to allocate or touch it.
     // STACK2_VADDR + FRAME_SIZE = 0xa01000, matching the literal
-    // stack_top immediate (mov r8, 0xa01000) in usermode.rs's step 13
-    // asm; no separate variable here since nothing in this fn passes
-    // it anywhere, unlike user_stack_top above.
+    // stack_top immediate (mov r8, 0xa01000) in usermode.rs's step 15
+    // Configure asm; no separate variable here since nothing in this
+    // fn passes it anywhere, unlike user_stack_top above.
 
     unsafe {
         let scratch_top =
@@ -549,6 +543,23 @@ fn usermode_selftest(com1: &mut serial::Serial) -> ! {
     };
     scheduler::with_current_cspace(|cspace| cspace.grant_root(6, untyped_cap))
         .expect("rose: usermode self-test: cspace grant_root (untyped) failed");
+
+    // Same boot-handoff stand-in, extended for Frame-Map: task 0's own
+    // CSpace slot 13 gets a root cap directly over code2_phys (not a
+    // Retype product, since Retype only ever hands back a *fresh*
+    // zeroed Frame, and this one has to already contain program2's
+    // real instructions). READ|MAP: enough for the ring-3 program's
+    // step 11 Map syscall to place it into slot9 at CODE2_VADDR with
+    // no WRITABLE flag; WRITE is deliberately withheld since nothing
+    // legitimate needs to write this page from ring 3.
+    let code2_cap = Capability {
+        object_ref: KernelObjectId(code2_phys),
+        object_type: ObjectType::Frame,
+        rights: Rights::READ.union(Rights::MAP),
+        badge: 0,
+    };
+    scheduler::with_current_cspace(|cspace| cspace.grant_root(13, code2_cap))
+        .expect("rose: usermode self-test: cspace grant_root (code2 frame) failed");
 
     let _ = writeln!(
         com1,

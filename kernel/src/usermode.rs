@@ -20,8 +20,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::gdt;
 use crate::serial;
 use crate::syscall::{
-    SYS_CSPACE_COPY, SYS_CSPACE_MINT, SYS_CSPACE_MOVE, SYS_CSPACE_REVOKE, SYS_THREAD_CONFIGURE,
-    SYS_UNTYPED_RETYPE,
+    SYS_CSPACE_COPY, SYS_CSPACE_MINT, SYS_CSPACE_MOVE, SYS_CSPACE_REVOKE, SYS_FRAME_MAP,
+    SYS_THREAD_CONFIGURE, SYS_UNTYPED_RETYPE,
 };
 
 // Hand-written user-mode machine code, not compiled Rust: there's no
@@ -59,16 +59,37 @@ use crate::syscall::{
 //   7.  RETYPE slot6 -> slot7,  Frame        (1)                 -> ok
 //   8.  RETYPE slot6 -> slot8,  CSpace       (9)                 -> ok
 //   9.  RETYPE slot6 -> slot9,  AddressSpace (3)                 -> ok
-//   10. RETYPE slot6 -> slot10, Thread       (4) (pool now empty) -> ok
-//   11. RETYPE slot6 -> slot11, Frame        (1) (pool empty)     -> Exhausted
-//   12. RETYPE slot6 -> slot12, PageTable    (2) (not retypeable) -> UnsupportedType
-// Extended past the twelve Retype steps with one Configure step,
-// cross-checked against on_configure_syscall's CONFIGURE_SYSCALL_STEPS
-// table below:
-//   13. CONFIGURE slot10 (Thread, from step 10) as=slot9 (AddressSpace,
+// Extended past the AddressSpace retype with two Frame-Map steps,
+// the actual fix for the Configure page-fault bug (see BUGS.md): the
+// second program's code/stack were previously mapped only into
+// user_as, a *different* AddressSpace object than the fresh one
+// slot9 points to, so the task Configure spawned against slot9
+// faulted on its very first instruction. Cross-checked against
+// on_frame_map_syscall's MAP_SYSCALL_STEPS table below:
+//   10. MAP    frame slot7  -> as slot9 @ 0xa00000 (STACK2_VADDR),
+//       flags=WRITABLE|NO_EXECUTE (3) (reuses the Frame retyped in
+//       step 7 above, which nothing had used until now; a fresh
+//       zeroed frame is exactly correct for a stack)          -> ok
+//   11. MAP    frame slot13 -> as slot9 @ 0x800000 (CODE2_VADDR),
+//       flags=0 (R+X, no WRITABLE) (slot13: a pre-populated root
+//       Frame cap over program2's actual instruction bytes, granted
+//       by main.rs's usermode_selftest ahead of time, same
+//       boot-handoff pattern as slot1/slot6; a freshly retyped
+//       zeroed frame can't hold real code, and ring-3 has no way to
+//       write frame contents via syscalls)                    -> ok
+// Extended past the two Map steps with the remaining three Retype
+// steps (unchanged target slots, just resequenced after Map):
+//   12. RETYPE slot6 -> slot10, Thread       (4) (pool now empty) -> ok
+//   13. RETYPE slot6 -> slot11, Frame        (1) (pool empty)     -> Exhausted
+//   14. RETYPE slot6 -> slot12, PageTable    (2) (not retypeable) -> UnsupportedType
+// Extended past the fourteen Retype/Map steps with one Configure
+// step, cross-checked against on_configure_syscall's
+// CONFIGURE_SYSCALL_STEPS table below:
+//   15. CONFIGURE slot10 (Thread, from step 12) as=slot9 (AddressSpace,
 //       from step 9), cspace=0 (fresh), entry=0x800000, stack_top=
-//       0xa01000 (second program's code/stack pages, see main.rs's
-//       usermode_selftest CODE2_VADDR/STACK2_VADDR)               -> ok
+//       0xa01000 (second program's code/stack pages, now actually
+//       mapped into slot9 itself by steps 10/11 above, not just into
+//       user_as)                                                -> ok
 core::arch::global_asm!(
     ".section .rodata.user_program, \"a\"",
     ".global user_program_start",
@@ -130,31 +151,51 @@ core::arch::global_asm!(
     "mov rdx, 9",
     "mov rax, 0x1004",
     "int 0x80",
-    // 10: RETYPE slot6 -> slot10, Thread (4), expect ok (pool of 4
-    // frames now fully spent by steps 7 through 10)
+    // 10: MAP frame slot7 -> as slot9 @ 0xa00000 (STACK2_VADDR),
+    // flags=3 (WRITABLE|NO_EXECUTE), expect ok. Reuses the Frame
+    // retyped in step 7 above; a fresh zeroed frame is exactly
+    // correct for a stack.
+    "mov rdi, 7",
+    "mov rsi, 9",
+    "mov rdx, 0xa00000",
+    "mov r10, 3",
+    "mov rax, 0x1006",
+    "int 0x80",
+    // 11: MAP frame slot13 -> as slot9 @ 0x800000 (CODE2_VADDR),
+    // flags=0 (R+X, no WRITABLE), expect ok. slot13 is a pre-
+    // populated root Frame cap over program2's real instruction
+    // bytes, granted ahead of time by main.rs's usermode_selftest.
+    "mov rdi, 13",
+    "mov rsi, 9",
+    "mov rdx, 0x800000",
+    "mov r10, 0",
+    "mov rax, 0x1006",
+    "int 0x80",
+    // 12: RETYPE slot6 -> slot10, Thread (4), expect ok (pool of 4
+    // frames now fully spent by steps 7 through 12)
     "mov rdi, 6",
     "mov rsi, 4",
     "mov rdx, 10",
     "mov rax, 0x1004",
     "int 0x80",
-    // 11: RETYPE slot6 -> slot11, Frame (1), expect Exhausted (pool
-    // already spent by steps 7 through 10)
+    // 13: RETYPE slot6 -> slot11, Frame (1), expect Exhausted (pool
+    // already spent by steps 7 through 12)
     "mov rdi, 6",
     "mov rsi, 1",
     "mov rdx, 11",
     "mov rax, 0x1004",
     "int 0x80",
-    // 12: RETYPE slot6 -> slot12, PageTable (2), expect UnsupportedType
+    // 14: RETYPE slot6 -> slot12, PageTable (2), expect UnsupportedType
     // (deliberately not retypeable, see untyped.rs module doc)
     "mov rdi, 6",
     "mov rsi, 2",
     "mov rdx, 12",
     "mov rax, 0x1004",
     "int 0x80",
-    // 13: CONFIGURE slot10 (Thread) as=slot9 (AddressSpace), cspace=0
+    // 15: CONFIGURE slot10 (Thread) as=slot9 (AddressSpace), cspace=0
     // (fresh), entry=0x800000, stack_top=0xa01000 (second program's
-    // code/stack, mapped by main.rs's usermode_selftest into this
-    // same address space at CODE2_VADDR/STACK2_VADDR)
+    // code/stack, now actually mapped into slot9 itself by steps
+    // 10/11 above, not just into user_as)
     "mov rdi, 10",
     "mov rsi, 9",
     "mov rdx, 0",
@@ -432,6 +473,82 @@ pub fn on_untyped_syscall(arg1: u64, arg2: u64, arg3: u64, result: u64) {
     }
 }
 
+static MAP_SYSCALL_STEP: AtomicU64 = AtomicU64::new(0);
+static MAP_SYSCALL_ALL_OK: AtomicBool = AtomicBool::new(true);
+
+/// One row per syscall in the fixed two-step Frame-Map sequence
+/// appended to the ring-3 program above, run immediately after the
+/// AddressSpace retype (step 9) and before the remaining three
+/// Retype steps; index must line up with call order exactly.
+const MAP_SYSCALL_STEPS: [(&str, ExpectedOutcome); 2] = [
+    (
+        "map frame slot7 -> as slot9 @ 0xa00000 (STACK2_VADDR), flags=WRITABLE|NO_EXECUTE",
+        ExpectedOutcome::Success,
+    ),
+    (
+        "map frame slot13 -> as slot9 @ 0x800000 (CODE2_VADDR), flags=none (R+X)",
+        ExpectedOutcome::Success,
+    ),
+];
+
+/// Called from idt.rs's rose_exception_handler for every `int 0x80`
+/// carrying the Frame-Map syscall number. Verifies each of the two
+/// against MAP_SYSCALL_STEPS in order; same shape as
+/// on_untyped_syscall just above. This is the actual fix for the
+/// Configure page-fault bug (see BUGS.md): once both of these land,
+/// slot9's AddressSpace has real mappings at CODE2_VADDR/STACK2_VADDR,
+/// not just user_as.
+pub fn on_frame_map_syscall(arg1: u64, arg2: u64, arg3: u64, arg4: u64, result: u64) {
+    let mut com1 = serial::Serial::init();
+    let step = MAP_SYSCALL_STEP.fetch_add(1, Ordering::Relaxed);
+
+    let Some(&(label, ref expected)) = MAP_SYSCALL_STEPS.get(step as usize) else {
+        let _ = writeln!(
+            com1,
+            "rose: frame map syscall self-test: unexpected step {} (num={:#x}), FAILED",
+            step + 1,
+            SYS_FRAME_MAP
+        );
+        MAP_SYSCALL_ALL_OK.store(false, Ordering::Relaxed);
+        return;
+    };
+
+    let ok = match *expected {
+        ExpectedOutcome::Success => (result as i64) >= 0,
+        ExpectedOutcome::Error(code) => result == code,
+    };
+    if !ok {
+        MAP_SYSCALL_ALL_OK.store(false, Ordering::Relaxed);
+    }
+
+    let _ = writeln!(
+        com1,
+        "rose: frame map syscall self-test: step {} {} (args={:#x},{:#x},{:#x},{:#x}) result={:#x} {}",
+        step + 1,
+        label,
+        arg1,
+        arg2,
+        arg3,
+        arg4,
+        result,
+        if ok { "ok" } else { "FAILED" }
+    );
+
+    if step + 1 >= MAP_SYSCALL_STEPS.len() as u64 {
+        let map_ok = MAP_SYSCALL_ALL_OK.load(Ordering::Relaxed);
+        let _ = writeln!(
+            com1,
+            "rose: frame map syscall self-test: sequence complete, overall {}",
+            if map_ok { "confirmed" } else { "FAILED" }
+        );
+        // No halt here, same reasoning as on_untyped_syscall's own
+        // comment: the ring-3 program's ordering table continues
+        // straight into the remaining Retype steps and then Configure,
+        // and the true final aggregate report is in
+        // on_configure_syscall below.
+    }
+}
+
 static CONFIGURE_SYSCALL_STEP: AtomicU64 = AtomicU64::new(0);
 static CONFIGURE_SYSCALL_ALL_OK: AtomicBool = AtomicBool::new(true);
 
@@ -501,6 +618,7 @@ pub fn on_configure_syscall(arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u6
     if step + 1 >= CONFIGURE_SYSCALL_STEPS.len() as u64 {
         let cspace_ok = CSPACE_SYSCALL_ALL_OK.load(Ordering::Relaxed);
         let untyped_ok = UNTYPED_SYSCALL_ALL_OK.load(Ordering::Relaxed);
+        let map_ok = MAP_SYSCALL_ALL_OK.load(Ordering::Relaxed);
         let configure_ok = CONFIGURE_SYSCALL_ALL_OK.load(Ordering::Relaxed);
         let _ = writeln!(
             com1,
@@ -510,7 +628,7 @@ pub fn on_configure_syscall(arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u6
         let _ = writeln!(
             com1,
             "rose: usermode self-test: full boot sequence {}",
-            if cspace_ok && untyped_ok && configure_ok {
+            if cspace_ok && untyped_ok && map_ok && configure_ok {
                 "confirmed"
             } else {
                 "FAILED"
