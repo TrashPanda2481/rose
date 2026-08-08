@@ -51,6 +51,19 @@ struct Task {
     // defaults to the kernel's, `spawn_in` picks any. Copy type (a
     // PML4 physical address), cheap to hold by value.
     address_space: AddressSpace,
+    // The top of this task's own, private ring0 entry stack: the value
+    // TSS.RSP0 must hold whenever this task is the one that might trap
+    // from ring 3. Every task before this feature shared one single
+    // global RSP0 (set once in main.rs), which was safe as long as
+    // only one ring-3-resident task ever existed at a time; once a
+    // second one showed up, both traps used the same buffer and could
+    // clobber each other's parked resume state, including the
+    // hardware-pushed exception frame, on a preemption mid-handler.
+    // See BUGS.md's now-fixed entry on the post-syscall page fault.
+    // Task 0 gets a real value at boot via `set_current_kernel_stack`,
+    // not just 0; every spawned task gets its own already-allocated
+    // stack's top, the same one `saved_rsp` is fabricated against.
+    kernel_stack_top: u64,
     // Every task gets its own CSpace at creation. Nothing is
     // reachable through a syscall until something (boot handoff today,
     // a parent task later) explicitly grants a root capability into
@@ -86,6 +99,7 @@ pub unsafe fn init() {
         saved_rsp: 0,
         _stack: None,
         address_space: paging::kernel_address_space(),
+        kernel_stack_top: 0,
         cspace: Box::new(CSpace::new()),
     });
     scheduler.current = 0;
@@ -159,6 +173,7 @@ pub fn spawn_in(entry: fn(), address_space: AddressSpace) -> usize {
         saved_rsp: sp,
         _stack: Some(stack),
         address_space,
+        kernel_stack_top: stack_top,
         cspace: Box::new(CSpace::new()),
     });
     scheduler.tasks.len() - 1
@@ -212,6 +227,7 @@ pub fn spawn_user(
         saved_rsp: sp,
         _stack: Some(stack),
         address_space,
+        kernel_stack_top: stack_top,
         cspace,
     });
     scheduler.tasks.len() - 1
@@ -257,6 +273,32 @@ pub fn set_current_address_space(new_as: AddressSpace) {
     }
 }
 
+/// Updates whichever task is current at the moment of the call to trap
+/// through `rsp0` (TSS.RSP0) from now on, and applies it to the TSS
+/// immediately, both under the same cli/sti bracket as
+/// `set_current_address_space` and for the identical reason: without
+/// applying it immediately, a real timer tick landing between the
+/// Task-field update and the TSS write could resume this same task via
+/// a stale TSS.RSP0 still pointing at whatever the previous holder left
+/// it as. Needed for exactly one caller today: `main.rs`'s boot path,
+/// replacing its old one-time raw `gdt::set_kernel_stack` call so task
+/// 0's own `kernel_stack_top` field is recorded, not just applied once
+/// and then forgotten by the scheduler.
+pub fn set_current_kernel_stack(rsp0: u64) {
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+    }
+    {
+        let mut scheduler = SCHEDULER.lock();
+        let current = scheduler.current;
+        scheduler.tasks[current].kernel_stack_top = rsp0;
+    }
+    unsafe {
+        gdt::set_kernel_stack(rsp0);
+        core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+    }
+}
+
 /// Called only from the timer IRQ handler in idt.rs, once per tick, with
 /// IF already 0 (interrupt gate). Decrements the current task's
 /// timeslice and switches to the next task round-robin once it runs
@@ -273,7 +315,7 @@ pub fn set_current_address_space(new_as: AddressSpace) {
 /// an empty queue would panic and halt the whole machine over what's
 /// really just a boot-sequencing question, not a correctness one.
 pub fn tick() {
-    let (old_rsp_ptr, new_rsp, next_as) = {
+    let (old_rsp_ptr, new_rsp, next_as, next_kernel_stack) = {
         let mut scheduler = SCHEDULER.lock();
         if scheduler.tasks.is_empty() {
             return;
@@ -295,7 +337,8 @@ pub fn tick() {
         let old_rsp_ptr = &mut scheduler.tasks[old_index].saved_rsp as *mut u64;
         let new_rsp = scheduler.tasks[next_index].saved_rsp;
         let next_as = scheduler.tasks[next_index].address_space;
-        (old_rsp_ptr, new_rsp, next_as)
+        let next_kernel_stack = scheduler.tasks[next_index].kernel_stack_top;
+        (old_rsp_ptr, new_rsp, next_as, next_kernel_stack)
         // Lock guard drops here, before the switch; context_switch
         // never returns to this stack frame until this task is
         // rescheduled, so holding the lock across it would deadlock
@@ -311,8 +354,17 @@ pub fn tick() {
     // flush; not worth the AddressSpace-equality check yet. Revisit if
     // this ever shows up as a real cost once components actually run
     // in separate spaces.
+    //
+    // Also always reloads TSS.RSP0 to the incoming task's own private
+    // entry stack, unconditionally, same reasoning as CR3 above: this
+    // is what gives every ring-3-resident task its own trap buffer
+    // instead of the old single shared one, closing the collision this
+    // was fixed for. Must happen before context_switch, same as the AS
+    // switch: once context_switch runs, this stack frame doesn't
+    // resume again until this task is rescheduled.
     unsafe {
         next_as.switch();
+        gdt::set_kernel_stack(next_kernel_stack);
         context_switch(old_rsp_ptr, new_rsp);
     }
     SWITCHES.fetch_add(1, Ordering::Relaxed);
@@ -336,7 +388,7 @@ pub fn yield_now() {
         core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
     }
 
-    let (old_rsp_ptr, new_rsp, next_as) = {
+    let (old_rsp_ptr, new_rsp, next_as, next_kernel_stack) = {
         let mut scheduler = SCHEDULER.lock();
         let old_index = scheduler.current;
         let next_index = (old_index + 1) % scheduler.tasks.len();
@@ -353,13 +405,16 @@ pub fn yield_now() {
         let old_rsp_ptr = &mut scheduler.tasks[old_index].saved_rsp as *mut u64;
         let new_rsp = scheduler.tasks[next_index].saved_rsp;
         let next_as = scheduler.tasks[next_index].address_space;
-        (old_rsp_ptr, new_rsp, next_as)
+        let next_kernel_stack = scheduler.tasks[next_index].kernel_stack_top;
+        (old_rsp_ptr, new_rsp, next_as, next_kernel_stack)
     };
 
-    // See the matching comment in tick(): always reloads CR3 for now,
-    // same-AS case not special-cased yet.
+    // See the matching comments in tick(): always reloads CR3 for now,
+    // same-AS case not special-cased yet, and always reloads TSS.RSP0
+    // to the incoming task's own private entry stack.
     unsafe {
         next_as.switch();
+        gdt::set_kernel_stack(next_kernel_stack);
         context_switch(old_rsp_ptr, new_rsp);
     }
     SWITCHES.fetch_add(1, Ordering::Relaxed);

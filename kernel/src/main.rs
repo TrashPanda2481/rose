@@ -500,11 +500,20 @@ fn usermode_selftest(com1: &mut serial::Serial) -> ! {
     // Configure asm; no separate variable here since nothing in this
     // fn passes it anywhere, unlike user_stack_top above.
 
-    unsafe {
-        let scratch_top =
-            core::ptr::addr_of!(KERNEL_SCRATCH_STACK) as u64 + KERNEL_SCRATCH_STACK_SIZE as u64;
-        gdt::set_kernel_stack(scratch_top);
-    }
+    let scratch_top =
+        core::ptr::addr_of!(KERNEL_SCRATCH_STACK) as u64 + KERNEL_SCRATCH_STACK_SIZE as u64;
+    // Goes through the scheduler now instead of calling
+    // gdt::set_kernel_stack directly: this records the value as
+    // task 0's own kernel_stack_top too, not just applying it to the
+    // TSS once and leaving the scheduler's own copy at the 0 that
+    // init() set. Without this, the very first real preemption of
+    // task 0 (or a switch away and back) would reload TSS.RSP0 from
+    // that stale 0 instead of scratch_top. Safe fn, no unsafe block
+    // needed here: taking a static mut's address via addr_of! doesn't
+    // require it, and set_current_kernel_stack does its own unsafe
+    // internally. See scheduler.rs's Task::kernel_stack_top doc
+    // comment and BUGS.md's now-fixed entry on the per-task RSP0 fix.
+    scheduler::set_current_kernel_stack(scratch_top);
 
     // Boot handoff stand-in: task 0's own CSpace slot 1 gets a root
     // cap over the kernel AddressSpace, exactly like cspace_selftest's
