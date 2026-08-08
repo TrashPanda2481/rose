@@ -28,6 +28,7 @@
 // under real preemption, not just a single manual switch.
 
 use crate::cspace::CSpace;
+use crate::gdt;
 use crate::mem::SpinLock;
 use crate::paging::{self, AddressSpace};
 use alloc::boxed::Box;
@@ -50,12 +51,29 @@ struct Task {
     // defaults to the kernel's, `spawn_in` picks any. Copy type (a
     // PML4 physical address), cheap to hold by value.
     address_space: AddressSpace,
-    // Every task gets its own empty CSpace at creation. Nothing is
+    // The top of this task's own, private ring0 entry stack: the value
+    // TSS.RSP0 must hold whenever this task is the one that might trap
+    // from ring 3. Every task before this feature shared one single
+    // global RSP0 (set once in main.rs), which was safe as long as
+    // only one ring-3-resident task ever existed at a time; once a
+    // second one showed up, both traps used the same buffer and could
+    // clobber each other's parked resume state, including the
+    // hardware-pushed exception frame, on a preemption mid-handler.
+    // See BUGS.md's now-fixed entry on the post-syscall page fault.
+    // Task 0 gets a real value at boot via `set_current_kernel_stack`,
+    // not just 0; every spawned task gets its own already-allocated
+    // stack's top, the same one `saved_rsp` is fabricated against.
+    kernel_stack_top: u64,
+    // Every task gets its own CSpace at creation. Nothing is
     // reachable through a syscall until something (boot handoff today,
     // a parent task later) explicitly grants a root capability into
     // it; see cspace.rs's own doc comment ("if it's not in your
-    // CSpace, it doesn't exist for you").
-    cspace: CSpace,
+    // CSpace, it doesn't exist for you"). Boxed rather than inline:
+    // `spawn_user` takes ownership of a caller-supplied CSpace
+    // (thread::configure, via untyped::take_cspace) rather than always
+    // building a fresh one, and a Box is what lets that already-boxed
+    // object move straight in without an extra copy.
+    cspace: Box<CSpace>,
 }
 
 struct Scheduler {
@@ -81,7 +99,8 @@ pub unsafe fn init() {
         saved_rsp: 0,
         _stack: None,
         address_space: paging::kernel_address_space(),
-        cspace: CSpace::new(),
+        kernel_stack_top: 0,
+        cspace: Box::new(CSpace::new()),
     });
     scheduler.current = 0;
     scheduler.ticks_left = TIMESLICE_TICKS;
@@ -154,7 +173,62 @@ pub fn spawn_in(entry: fn(), address_space: AddressSpace) -> usize {
         saved_rsp: sp,
         _stack: Some(stack),
         address_space,
-        cspace: CSpace::new(),
+        kernel_stack_top: stack_top,
+        cspace: Box::new(CSpace::new()),
+    });
+    scheduler.tasks.len() - 1
+}
+
+/// Builds a brand-new task that lands directly in ring 3 on its first
+/// run, instead of `spawn_in`'s ring-0 `entry: fn()`. Used exclusively
+/// by `thread::configure`: a Configure syscall supplies its own
+/// `address_space` (already mapped with whatever the caller wants
+/// `entry`/`user_stack_top` to point at) and `cspace` (either a fresh
+/// one thread::configure built, or one taken from a caller-supplied
+/// CSpace cap via `untyped::take_cspace`), and this just wires those
+/// into a schedulable Task the same way `spawn_in` does for a kernel
+/// task.
+///
+/// Same fabricated-frame trick as `spawn_in`, with two changes: the
+/// return address is `user_task_trampoline` instead of
+/// `task_trampoline`, and the rbp slot (always 0 in `spawn_in`'s
+/// frame, since a ring-0 `fn()` entry takes no arguments) carries
+/// `user_stack_top` instead. `user_task_trampoline` reads `entry` out
+/// of rbx (same convention as `task_trampoline`) and `user_stack_top`
+/// out of rbp, then builds the iretq frame from those plus the fixed
+/// ring-3 GDT selectors.
+pub fn spawn_user(
+    entry: u64,
+    user_stack_top: u64,
+    address_space: AddressSpace,
+    cspace: Box<CSpace>,
+) -> usize {
+    let mut stack: Box<[u8]> = alloc::vec![0u8; STACK_SIZE].into_boxed_slice();
+    let stack_top = stack.as_mut_ptr() as u64 + STACK_SIZE as u64;
+    let frame = [
+        user_task_trampoline as *const () as u64,
+        entry,
+        user_stack_top, // rbp slot, repurposed; see doc comment above
+        0u64,           // r12
+        0u64,           // r13
+        0u64,           // r14
+        0u64,           // r15
+    ];
+    let mut sp = stack_top;
+    for value in frame.iter() {
+        sp -= 8;
+        unsafe {
+            (sp as *mut u64).write(*value);
+        }
+    }
+
+    let mut scheduler = SCHEDULER.lock();
+    scheduler.tasks.push(Task {
+        saved_rsp: sp,
+        _stack: Some(stack),
+        address_space,
+        kernel_stack_top: stack_top,
+        cspace,
     });
     scheduler.tasks.len() - 1
 }
@@ -199,6 +273,32 @@ pub fn set_current_address_space(new_as: AddressSpace) {
     }
 }
 
+/// Updates whichever task is current at the moment of the call to trap
+/// through `rsp0` (TSS.RSP0) from now on, and applies it to the TSS
+/// immediately, both under the same cli/sti bracket as
+/// `set_current_address_space` and for the identical reason: without
+/// applying it immediately, a real timer tick landing between the
+/// Task-field update and the TSS write could resume this same task via
+/// a stale TSS.RSP0 still pointing at whatever the previous holder left
+/// it as. Needed for exactly one caller today: `main.rs`'s boot path,
+/// replacing its old one-time raw `gdt::set_kernel_stack` call so task
+/// 0's own `kernel_stack_top` field is recorded, not just applied once
+/// and then forgotten by the scheduler.
+pub fn set_current_kernel_stack(rsp0: u64) {
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+    }
+    {
+        let mut scheduler = SCHEDULER.lock();
+        let current = scheduler.current;
+        scheduler.tasks[current].kernel_stack_top = rsp0;
+    }
+    unsafe {
+        gdt::set_kernel_stack(rsp0);
+        core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+    }
+}
+
 /// Called only from the timer IRQ handler in idt.rs, once per tick, with
 /// IF already 0 (interrupt gate). Decrements the current task's
 /// timeslice and switches to the next task round-robin once it runs
@@ -215,7 +315,7 @@ pub fn set_current_address_space(new_as: AddressSpace) {
 /// an empty queue would panic and halt the whole machine over what's
 /// really just a boot-sequencing question, not a correctness one.
 pub fn tick() {
-    let (old_rsp_ptr, new_rsp, next_as) = {
+    let (old_rsp_ptr, new_rsp, next_as, next_kernel_stack) = {
         let mut scheduler = SCHEDULER.lock();
         if scheduler.tasks.is_empty() {
             return;
@@ -237,7 +337,8 @@ pub fn tick() {
         let old_rsp_ptr = &mut scheduler.tasks[old_index].saved_rsp as *mut u64;
         let new_rsp = scheduler.tasks[next_index].saved_rsp;
         let next_as = scheduler.tasks[next_index].address_space;
-        (old_rsp_ptr, new_rsp, next_as)
+        let next_kernel_stack = scheduler.tasks[next_index].kernel_stack_top;
+        (old_rsp_ptr, new_rsp, next_as, next_kernel_stack)
         // Lock guard drops here, before the switch; context_switch
         // never returns to this stack frame until this task is
         // rescheduled, so holding the lock across it would deadlock
@@ -253,8 +354,17 @@ pub fn tick() {
     // flush; not worth the AddressSpace-equality check yet. Revisit if
     // this ever shows up as a real cost once components actually run
     // in separate spaces.
+    //
+    // Also always reloads TSS.RSP0 to the incoming task's own private
+    // entry stack, unconditionally, same reasoning as CR3 above: this
+    // is what gives every ring-3-resident task its own trap buffer
+    // instead of the old single shared one, closing the collision this
+    // was fixed for. Must happen before context_switch, same as the AS
+    // switch: once context_switch runs, this stack frame doesn't
+    // resume again until this task is rescheduled.
     unsafe {
         next_as.switch();
+        gdt::set_kernel_stack(next_kernel_stack);
         context_switch(old_rsp_ptr, new_rsp);
     }
     SWITCHES.fetch_add(1, Ordering::Relaxed);
@@ -278,7 +388,7 @@ pub fn yield_now() {
         core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
     }
 
-    let (old_rsp_ptr, new_rsp, next_as) = {
+    let (old_rsp_ptr, new_rsp, next_as, next_kernel_stack) = {
         let mut scheduler = SCHEDULER.lock();
         let old_index = scheduler.current;
         let next_index = (old_index + 1) % scheduler.tasks.len();
@@ -295,13 +405,16 @@ pub fn yield_now() {
         let old_rsp_ptr = &mut scheduler.tasks[old_index].saved_rsp as *mut u64;
         let new_rsp = scheduler.tasks[next_index].saved_rsp;
         let next_as = scheduler.tasks[next_index].address_space;
-        (old_rsp_ptr, new_rsp, next_as)
+        let next_kernel_stack = scheduler.tasks[next_index].kernel_stack_top;
+        (old_rsp_ptr, new_rsp, next_as, next_kernel_stack)
     };
 
-    // See the matching comment in tick(): always reloads CR3 for now,
-    // same-AS case not special-cased yet.
+    // See the matching comments in tick(): always reloads CR3 for now,
+    // same-AS case not special-cased yet, and always reloads TSS.RSP0
+    // to the incoming task's own private entry stack.
     unsafe {
         next_as.switch();
+        gdt::set_kernel_stack(next_kernel_stack);
         context_switch(old_rsp_ptr, new_rsp);
     }
     SWITCHES.fetch_add(1, Ordering::Relaxed);
@@ -362,5 +475,33 @@ extern "C" fn task_trampoline() -> ! {
         "2:",
         "hlt",
         "jmp 2b",
+    )
+}
+
+/// Landing pad for a Configure-spawned task's very first run, same
+/// reasoning as `task_trampoline` (reached via context_switch's `ret`
+/// on first run, never through iretq or yield_now's own sti, so `sti`
+/// has to come first here too) but dropping straight into ring 3
+/// instead of calling a ring-0 fn. Replicates `enter_user_mode`'s
+/// exact push order (SS, RSP, RFLAGS, CS, RIP, so RIP ends up topmost
+/// per iretq's own pop order) by hand, since a naked fn can't call
+/// into a normal `unsafe fn` mid-asm: `entry` (RIP) comes in via rbx
+/// and `user_stack_top` (RSP) via rbp, exactly as `spawn_user`'s
+/// fabricated frame laid them out; SS/CS/RFLAGS are the same fixed
+/// ring-3 values `enter_user_mode` uses, embedded as naked_asm consts
+/// since there's no register budget left to spare for them here.
+#[unsafe(naked)]
+extern "C" fn user_task_trampoline() -> ! {
+    core::arch::naked_asm!(
+        "sti",
+        "push {user_ss}",
+        "push rbp",
+        "push {rflags}",
+        "push {user_cs}",
+        "push rbx",
+        "iretq",
+        user_ss = const gdt::USER_DATA_SELECTOR as u64,
+        rflags = const 0x202u64,
+        user_cs = const gdt::USER_CODE_SELECTOR as u64,
     )
 }

@@ -12,16 +12,31 @@
 // value in rax on exit: 0 or positive means success, negative means
 // an error whose magnitude is the CSpaceError code.
 
-use crate::cspace::CSpaceError;
+use crate::cspace::{CSpace, CSpaceError};
+use crate::mem;
+use crate::paging;
 use crate::scheduler;
+use crate::thread::{self, ConfigureError};
 use crate::untyped::{self, UntypedError};
 use abi::{Capability, KernelObjectId, ObjectType, Rights};
+use alloc::boxed::Box;
 
 pub const SYS_CSPACE_COPY: u64 = 0x1000;
 pub const SYS_CSPACE_MINT: u64 = 0x1001;
 pub const SYS_CSPACE_MOVE: u64 = 0x1002;
 pub const SYS_CSPACE_REVOKE: u64 = 0x1003;
 pub const SYS_UNTYPED_RETYPE: u64 = 0x1004;
+pub const SYS_THREAD_CONFIGURE: u64 = 0x1005;
+pub const SYS_FRAME_MAP: u64 = 0x1006;
+
+/// Frame-Map's own flags argument: a small, clean bitfield instead of
+/// raw hardware PTE bits. paging.rs's PAGE_* constants are an
+/// implementation detail this syscall boundary shouldn't leak, same
+/// "userspace never sees the raw representation" reasoning as
+/// Rights::bits() existing instead of exposing a derivation-tree
+/// pointer directly.
+pub const MAP_FLAG_WRITABLE: u64 = 1 << 0;
+pub const MAP_FLAG_NO_EXECUTE: u64 = 1 << 1;
 
 /// True if `num` is one of the syscall numbers this module handles.
 /// idt.rs uses this to route between the new CSpace path and the
@@ -41,6 +56,23 @@ pub fn is_cspace_syscall(num: u64) -> bool {
 /// which the CSpace-only `encode` above has no way to represent.
 pub fn is_untyped_syscall(num: u64) -> bool {
     num == SYS_UNTYPED_RETYPE
+}
+
+/// True if `num` is the Configure syscall. Own predicate/dispatch pair,
+/// same reasoning as `is_untyped_syscall` above: Configure's own
+/// ConfigureError is a third, unrelated error enum, and its success
+/// value (a scheduler task index) has nothing to do with either
+/// CSpaceError's or UntypedError's own encoding.
+pub fn is_configure_syscall(num: u64) -> bool {
+    num == SYS_THREAD_CONFIGURE
+}
+
+/// True if `num` is the Frame-Map syscall. Own predicate/dispatch
+/// pair, same reasoning as `is_configure_syscall` above: MapError is
+/// its own small enum, unrelated to CSpaceError/UntypedError/
+/// ConfigureError.
+pub fn is_frame_map_syscall(num: u64) -> bool {
+    num == SYS_FRAME_MAP
 }
 
 /// Maps a CSpace op's Result onto the single-register return
@@ -179,4 +211,193 @@ pub fn dispatch_untyped(arg1: u64, arg2: u64, arg3: u64) -> u64 {
     });
 
     encode_untyped(result)
+}
+
+/// Maps a Configure Result onto the single-register return convention:
+/// 0 or positive is success, carrying the new task's scheduler index.
+/// Negative means failure; ConfigureError codes are offset by +20
+/// (21-24) so they never collide with CSpaceError's 1-4 or
+/// UntypedError's 11-13 in the one shared register, same banding
+/// convention as `encode_untyped`'s own +10 offset for UntypedError.
+fn encode_configure(result: Result<usize, ConfigureError>) -> u64 {
+    match result {
+        Ok(idx) => idx as u64,
+        Err(e) => (-(e.code() as i64 + 20)) as u64,
+    }
+}
+
+/// Runs Configure against the calling task's own CSpace. Argument
+/// meaning: arg1=thread cptr, arg2=AddressSpace cptr, arg3=CSpace
+/// cptr (0 means "none, build a fresh empty CSpace instead"),
+/// arg4=entry, arg5=stack_top.
+///
+/// Two-phase, same reasoning as `dispatch_untyped`'s ordering comment:
+/// every cap lookup/rights check happens first, inside a single
+/// `with_current_cspace` call, and only once all three cptrs resolve
+/// does this call out to `thread::configure` (outside that closure).
+/// This isn't just style: `thread::configure` calls
+/// `scheduler::spawn_user`, which takes the same SCHEDULER lock
+/// `with_current_cspace` is already holding for the duration of its
+/// own closure; calling it from inside that closure would be a
+/// self-deadlock against a non-reentrant spinlock, not just untidy
+/// nesting.
+pub fn dispatch_configure(arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> u64 {
+    let thread_cptr = arg1 as u32;
+    let as_cptr = arg2 as u32;
+    let cspace_cptr = arg3 as u32;
+
+    let prepared = scheduler::with_current_cspace(
+        |cspace| -> Result<(u64, paging::AddressSpace, Option<Box<CSpace>>), ConfigureError> {
+            let thread_cap = cspace
+                .lookup(thread_cptr)
+                .filter(|cap| {
+                    cap.object_type == ObjectType::Thread && cap.rights.contains(Rights::GRANT)
+                })
+                .ok_or(ConfigureError::InvalidThread)?;
+
+            let as_cap = cspace
+                .lookup(as_cptr)
+                .filter(|cap| {
+                    cap.object_type == ObjectType::AddressSpace
+                        && cap.rights.contains(Rights::MAP)
+                })
+                .ok_or(ConfigureError::InvalidAddressSpace)?;
+
+            let cspace_box = if cspace_cptr == 0 {
+                None
+            } else {
+                let cs_cap = cspace
+                    .lookup(cspace_cptr)
+                    .filter(|cap| {
+                        cap.object_type == ObjectType::CSpace
+                            && cap.rights.contains(Rights::GRANT)
+                    })
+                    .ok_or(ConfigureError::InvalidCSpace)?;
+                Some(
+                    untyped::take_cspace(cs_cap.object_ref.0)
+                        .ok_or(ConfigureError::InvalidCSpace)?,
+                )
+            };
+
+            let address_space = paging::AddressSpace::from_raw(as_cap.object_ref.0);
+            Ok((thread_cap.object_ref.0, address_space, cspace_box))
+        },
+    );
+
+    let result = prepared.and_then(|(thread_id, address_space, cspace_box)| {
+        thread::configure(thread_id, address_space, cspace_box, arg4, arg5)
+    });
+
+    encode_configure(result)
+}
+
+/// Reasons Frame-Map can fail. Own small code space, same pattern as
+/// every other syscall's error enum here.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MapError {
+    /// The frame cptr didn't resolve to a usable Frame cap (wrong
+    /// object type, missing MAP right), or the caller asked for a
+    /// writable mapping (MAP_FLAG_WRITABLE) out of a Frame cap that
+    /// was never granted WRITE.
+    InvalidFrame,
+    /// The AddressSpace cptr didn't resolve to a usable AddressSpace
+    /// cap (wrong object type, missing MAP right).
+    InvalidAddressSpace,
+    /// `vaddr` isn't 4K-aligned. paging.rs's map_page has no
+    /// alignment check of its own (every existing caller already
+    /// passes aligned constants), so this syscall is the first place
+    /// an unaligned value could actually arrive from outside the
+    /// kernel's own control.
+    Misaligned,
+}
+
+impl MapError {
+    /// Stable small integer per variant, same convention as every
+    /// other error enum's own `code()`.
+    pub fn code(&self) -> u8 {
+        match self {
+            MapError::InvalidFrame => 1,
+            MapError::InvalidAddressSpace => 2,
+            MapError::Misaligned => 3,
+        }
+    }
+}
+
+/// Maps a Frame-Map Result onto the single-register return convention.
+/// +30 offset: the next free band after CSpaceError's bare 1-4,
+/// UntypedError's +10 (11-13), and ConfigureError's +20 (21-24), same
+/// non-colliding-band convention as `encode_configure`'s own comment.
+fn encode_map(result: Result<(), MapError>) -> u64 {
+    match result {
+        Ok(()) => 0,
+        Err(e) => (-(e.code() as i64 + 30)) as u64,
+    }
+}
+
+/// Runs Frame-Map against the calling task's own CSpace. Argument
+/// meaning: arg1=frame cptr, arg2=AddressSpace cptr, arg3=virtual
+/// address, arg4=flags (MAP_FLAG_* bits above).
+///
+/// This is the first syscall that calls `AddressSpace::map_page`
+/// through the capability layer instead of a kernel-held raw handle;
+/// it closes exactly the gap untyped.rs's own module doc flagged
+/// ("Frame caps produced here don't do anything yet ... it's an empty
+/// address space until some future Frame.Map syscall populates it").
+///
+/// Always adds PAGE_USER: this syscall exists to populate a target
+/// AddressSpace with user-mapped pages, not to let a task remap its
+/// own kernel-AddressSpace cap (slot1 in the self-test) with
+/// different permissions. There's no legitimate use for a kernel-
+/// target mapping through this path yet, and forcing PAGE_USER here
+/// is cheaper than adding a whole "is this AddressSpace the kernel's
+/// own" permission model this early. Revisit if a real use for
+/// kernel-target mapping via capability ever shows up.
+pub fn dispatch_frame_map(arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
+    let frame_cptr = arg1 as u32;
+    let as_cptr = arg2 as u32;
+    let vaddr = arg3;
+    let flag_bits = arg4;
+
+    let result = scheduler::with_current_cspace(|cspace| -> Result<(), MapError> {
+        let frame_cap = cspace
+            .lookup(frame_cptr)
+            .filter(|cap| {
+                cap.object_type == ObjectType::Frame && cap.rights.contains(Rights::MAP)
+            })
+            .ok_or(MapError::InvalidFrame)?;
+
+        let as_cap = cspace
+            .lookup(as_cptr)
+            .filter(|cap| {
+                cap.object_type == ObjectType::AddressSpace && cap.rights.contains(Rights::MAP)
+            })
+            .ok_or(MapError::InvalidAddressSpace)?;
+
+        if vaddr % mem::FRAME_SIZE != 0 {
+            return Err(MapError::Misaligned);
+        }
+
+        // Requesting a writable mapping out of a Frame cap that was
+        // never granted WRITE would let a read-only capability become
+        // writable memory just by picking a flag bit; reject it the
+        // same "rights gate what you can do, not just whether the cap
+        // exists" way every other syscall here already does.
+        if flag_bits & MAP_FLAG_WRITABLE != 0 && !frame_cap.rights.contains(Rights::WRITE) {
+            return Err(MapError::InvalidFrame);
+        }
+
+        let mut flags = paging::PAGE_USER;
+        if flag_bits & MAP_FLAG_WRITABLE != 0 {
+            flags |= paging::PAGE_WRITABLE;
+        }
+        if flag_bits & MAP_FLAG_NO_EXECUTE != 0 {
+            flags |= paging::PAGE_NO_EXECUTE;
+        }
+
+        let address_space = paging::AddressSpace::from_raw(as_cap.object_ref.0);
+        unsafe { address_space.map_page(vaddr, frame_cap.object_ref.0, flags) };
+        Ok(())
+    });
+
+    encode_map(result)
 }

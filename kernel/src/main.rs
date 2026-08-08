@@ -10,10 +10,12 @@ mod heap;
 mod idt;
 mod mem;
 mod paging;
+mod pci;
 mod pic;
 mod scheduler;
 mod serial;
 mod syscall;
+mod thread;
 mod timer;
 mod untyped;
 mod usermode;
@@ -153,6 +155,8 @@ unsafe extern "C" fn kernel_main() -> ! {
     scheduled_address_space_selftest(&mut com1);
 
     cspace_selftest(&mut com1);
+
+    pci_selftest(&mut com1);
 
     usermode_selftest(&mut com1)
 }
@@ -416,6 +420,20 @@ fn usermode_selftest(com1: &mut serial::Serial) -> ! {
     // nothing already mapped up here could collide).
     const CODE_VADDR: u64 = 0x0000_0000_0040_0000;
     const STACK_VADDR: u64 = 0x0000_0000_0060_0000;
+    // Second program's own code/stack pages (see usermode.rs's
+    // program2_bytes and the ring-3 program's step 15 Configure) go
+    // at 0x800000 (CODE2_VADDR) and 0xa00000 (STACK2_VADDR). No local
+    // consts for these anymore, unlike CODE_VADDR/STACK_VADDR above:
+    // neither address is ever passed to a map_page call in this fn
+    // now (that was the bug, see BUGS.md's "Configure-spawned second
+    // task page-faults" entry) since real mappings into slot9 happen
+    // via the ring-3 program's own Map syscalls (steps 10/11) against
+    // capabilities this fn grants below (slot7's retyped Frame for
+    // the stack, slot13's pre-populated Frame for the code); a local
+    // const with no reader would just be dead code. The two literal
+    // addresses are hardcoded to match usermode.rs's Map/Configure asm
+    // immediates (mov rdx, 0x800000 / mov rdx, 0xa00000 / mov r8,
+    // 0xa01000); if any changes, the others have to change with it.
 
     // A real second AddressSpace now, not the kernel's currently-active
     // one (see address_space_selftest above, first thing to exercise
@@ -456,11 +474,46 @@ fn usermode_selftest(com1: &mut serial::Serial) -> ! {
     }
     let user_stack_top = STACK_VADDR + mem::FRAME_SIZE;
 
+    // Second program's code page. Not mapped here anymore (that was
+    // the bug); instead allocated and pre-populated with the real
+    // instruction bytes at ring-0 setup time (ring 3 has no way to
+    // write frame contents via syscalls), then granted below as a
+    // root Frame capability into slot13. The ring-3 program's own
+    // step 11 Map syscall is what actually puts it into slot9 at
+    // CODE2_VADDR.
+    let code2_phys = mem::FRAME_ALLOCATOR
+        .lock()
+        .alloc()
+        .expect("rose: usermode self-test: out of memory (code2)");
+    let program2 = usermode::program2_bytes();
     unsafe {
-        let scratch_top =
-            core::ptr::addr_of!(KERNEL_SCRATCH_STACK) as u64 + KERNEL_SCRATCH_STACK_SIZE as u64;
-        gdt::set_kernel_stack(scratch_top);
+        let code2_virt = paging::phys_to_virt(code2_phys) as *mut u8;
+        core::ptr::copy_nonoverlapping(program2.as_ptr(), code2_virt, program2.len());
     }
+    // Second program's stack page comes from neither a kernel-
+    // preallocated frame nor a direct map_page call anymore: it
+    // reuses the Frame already retyped into slot7 by the ring-3
+    // program's own step 7, mapped into slot9 by step 10's Map
+    // syscall. Nothing else here needs to allocate or touch it.
+    // STACK2_VADDR + FRAME_SIZE = 0xa01000, matching the literal
+    // stack_top immediate (mov r8, 0xa01000) in usermode.rs's step 15
+    // Configure asm; no separate variable here since nothing in this
+    // fn passes it anywhere, unlike user_stack_top above.
+
+    let scratch_top =
+        core::ptr::addr_of!(KERNEL_SCRATCH_STACK) as u64 + KERNEL_SCRATCH_STACK_SIZE as u64;
+    // Goes through the scheduler now instead of calling
+    // gdt::set_kernel_stack directly: this records the value as
+    // task 0's own kernel_stack_top too, not just applying it to the
+    // TSS once and leaving the scheduler's own copy at the 0 that
+    // init() set. Without this, the very first real preemption of
+    // task 0 (or a switch away and back) would reload TSS.RSP0 from
+    // that stale 0 instead of scratch_top. Safe fn, no unsafe block
+    // needed here: taking a static mut's address via addr_of! doesn't
+    // require it, and set_current_kernel_stack does its own unsafe
+    // internally. See scheduler.rs's Task::kernel_stack_top doc
+    // comment and BUGS.md's now-fixed entry on the per-task RSP0 fix.
+    scheduler::set_current_kernel_stack(scratch_top);
 
     // Boot handoff stand-in: task 0's own CSpace slot 1 gets a root
     // cap over the kernel AddressSpace, exactly like cspace_selftest's
@@ -499,6 +552,23 @@ fn usermode_selftest(com1: &mut serial::Serial) -> ! {
     };
     scheduler::with_current_cspace(|cspace| cspace.grant_root(6, untyped_cap))
         .expect("rose: usermode self-test: cspace grant_root (untyped) failed");
+
+    // Same boot-handoff stand-in, extended for Frame-Map: task 0's own
+    // CSpace slot 13 gets a root cap directly over code2_phys (not a
+    // Retype product, since Retype only ever hands back a *fresh*
+    // zeroed Frame, and this one has to already contain program2's
+    // real instructions). READ|MAP: enough for the ring-3 program's
+    // step 11 Map syscall to place it into slot9 at CODE2_VADDR with
+    // no WRITABLE flag; WRITE is deliberately withheld since nothing
+    // legitimate needs to write this page from ring 3.
+    let code2_cap = Capability {
+        object_ref: KernelObjectId(code2_phys),
+        object_type: ObjectType::Frame,
+        rights: Rights::READ.union(Rights::MAP),
+        badge: 0,
+    };
+    scheduler::with_current_cspace(|cspace| cspace.grant_root(13, code2_cap))
+        .expect("rose: usermode self-test: cspace grant_root (code2 frame) failed");
 
     let _ = writeln!(
         com1,
@@ -761,6 +831,33 @@ fn cspace_selftest(com1: &mut serial::Serial) {
         if all_cleared { "ok" } else { "FAILED" },
         if ok { "confirmed" } else { "FAILED" }
     );
+}
+
+/// Walks the PCI bus via the legacy config mechanism and logs every
+/// function that reports a real vendor id. No expected device list to
+/// check against, the point is discovery itself; QEMU's own standard
+/// virtual devices (host bridge, ISA bridge, etc.) show up here as
+/// ordinary log lines like anything else found.
+fn pci_selftest(com1: &mut serial::Serial) {
+    let _ = writeln!(com1, "rose: pci self-test: enumerating");
+    let mut count: u32 = 0;
+    pci::enumerate(|dev| {
+        count += 1;
+        let _ = writeln!(
+            com1,
+            "rose: pci: {:02x}:{:02x}.{} vendor={:04x} device={:04x} class={:02x} subclass={:02x} progif={:02x} rev={:02x}",
+            dev.bus,
+            dev.device,
+            dev.function,
+            dev.vendor_id,
+            dev.device_id,
+            dev.class_code,
+            dev.subclass,
+            dev.prog_if,
+            dev.revision_id
+        );
+    });
+    let _ = writeln!(com1, "rose: pci self-test: {} device(s) found", count);
 }
 
 fn frame_allocator_selftest(com1: &mut serial::Serial) {

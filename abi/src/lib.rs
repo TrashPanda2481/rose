@@ -116,10 +116,16 @@ impl Rights {
 
 /// Meaning is per-ObjectType, not a single global namespace: an
 /// AddressSpace cap's id is that AddressSpace's PML4 physical address
-/// (already unique by construction), a future Thread cap's id will be
-/// its task index. No shared generic kernel-object heap yet, that's
-/// Untyped/Retype's job, a later feature; this just reuses whatever
-/// stable identity the referenced object already has.
+/// (already unique by construction). A Thread cap's id is a registry
+/// index into the kernel's own THREAD_OBJECTS table (kernel/src/
+/// untyped.rs), not a scheduler task index directly; Configure
+/// (kernel/src/thread.rs) separately records which task index that
+/// registry entry maps to once configured, kept as a second lookup
+/// rather than folded into this id, so the cap's identity never has to
+/// change even though what it resolves to gains a second meaning partway
+/// through the object's life. No shared generic kernel-object heap yet,
+/// that's Untyped/Retype's job, a later feature; this just reuses
+/// whatever stable identity the referenced object already has.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct KernelObjectId(pub u64);
 

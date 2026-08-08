@@ -147,14 +147,15 @@ static UNTYPED_OBJECTS: SpinLock<Vec<Option<UntypedObject>>> = SpinLock::new(Vec
 /// per-ObjectType, not global, per abi's own doc comment on it.
 static CSPACE_OBJECTS: SpinLock<Vec<Option<Box<CSpace>>>> = SpinLock::new(Vec::new());
 
-/// A retyped-but-unconfigured Thread. Deliberately empty in v0.1: see
-/// this module's own doc comment for why (no scheduler wiring, no
-/// suspend/resume state, that's the Configure/Resume/Suspend/
-/// SetPriority syscall feature's job). Exists as its own type rather
-/// than a bare `()` placeholder so it has somewhere to grow into once
-/// that feature lands, same spirit as every other "prove it once,
-/// harden later" type in this codebase.
-pub struct ThreadObject;
+/// A retyped Thread. `task_index` is `None` until Configure
+/// (thread.rs) turns it into a live scheduler task; `Some(idx)` after
+/// that, recording which scheduler.rs task slot it became. Exists as
+/// its own type rather than a bare `()` placeholder so it has
+/// somewhere to hold that state, same spirit as every other "prove it
+/// once, harden later" type in this codebase.
+pub struct ThreadObject {
+    pub task_index: Option<usize>,
+}
 
 /// Global registry of Thread placeholders created by Retype. Separate
 /// counter/namespace from UNTYPED_OBJECTS and CSPACE_OBJECTS, same
@@ -181,6 +182,77 @@ fn register_thread(thread: ThreadObject) -> u64 {
     let mut objects = THREAD_OBJECTS.lock();
     objects.push(Some(thread));
     (objects.len() - 1) as u64
+}
+
+/// Reasons Configure's claim on a Thread registry entry can fail.
+/// Own small code space, same pattern as UntypedError; see thread.rs
+/// for how these map onto ConfigureError, and syscall.rs for the
+/// final single-register encoding.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ClaimThreadError {
+    /// `thread_id` didn't resolve to a live THREAD_OBJECTS entry.
+    InvalidThread,
+    /// The entry at `thread_id` already has `task_index` set; Configure
+    /// only ever runs once per Thread object in v0.1, see thread.rs.
+    AlreadyConfigured,
+}
+
+/// Read-only check that `thread_id` resolves to a live, not-yet-
+/// configured Thread entry, without claiming it. thread::configure
+/// calls this before doing any of the (fallible, partially
+/// irreversible) work of building a new scheduler task, so a bad
+/// thread_id fails fast before any of that happens. Note this leaves
+/// a window between this check and the later `claim_thread` call
+/// where the same entry could in principle be claimed twice; accepted
+/// for now because there's no real concurrency yet (single core,
+/// cooperative scheduler, no syscall reentrancy), same category of
+/// simplification as this module's own "reclamation semantics" cut.
+/// Revisit if/when either of those changes.
+pub fn peek_thread_unconfigured(thread_id: u64) -> Result<(), ClaimThreadError> {
+    let objects = THREAD_OBJECTS.lock();
+    let entry = objects
+        .get(thread_id as usize)
+        .and_then(|entry| entry.as_ref())
+        .ok_or(ClaimThreadError::InvalidThread)?;
+    if entry.task_index.is_some() {
+        return Err(ClaimThreadError::AlreadyConfigured);
+    }
+    Ok(())
+}
+
+/// Re-checks and sets `task_index` on the THREAD_OBJECTS entry at
+/// `thread_id`, under the same lock so the check-then-set is atomic
+/// with respect to itself (though not, per `peek_thread_unconfigured`'s
+/// doc comment, with respect to an earlier peek). Called by
+/// thread::configure after `scheduler::spawn_user` has already built
+/// the new task and produced its index; this is the step that makes
+/// that task index discoverable back through the original Thread
+/// capability.
+pub fn claim_thread(thread_id: u64, task_index: usize) -> Result<(), ClaimThreadError> {
+    let mut objects = THREAD_OBJECTS.lock();
+    let entry = objects
+        .get_mut(thread_id as usize)
+        .and_then(|entry| entry.as_mut())
+        .ok_or(ClaimThreadError::InvalidThread)?;
+    if entry.task_index.is_some() {
+        return Err(ClaimThreadError::AlreadyConfigured);
+    }
+    entry.task_index = Some(task_index);
+    Ok(())
+}
+
+/// One-way consumption of a CSPACE_OBJECTS entry: hands the boxed
+/// CSpace out to the caller and leaves the registry slot empty behind
+/// it, same bump-out-and-leave-a-hole pattern as `UntypedObject::
+/// take_frame` (just at the granularity of a whole object instead of
+/// a frame). Used by syscall.rs's `dispatch_configure` to move a
+/// caller-supplied CSpace cap's backing object into the new Task it's
+/// building; once taken, the original CSpace cap has nothing live
+/// left behind it, matching how a consumed Untyped-derived frame cap
+/// already works.
+pub fn take_cspace(cspace_id: u64) -> Option<Box<CSpace>> {
+    let mut objects = CSPACE_OBJECTS.lock();
+    objects.get_mut(cspace_id as usize)?.take()
 }
 
 /// Retypes one frame out of the Untyped object at `untyped_id` into
@@ -227,7 +299,7 @@ pub fn retype(untyped_id: u64, object_type: ObjectType) -> Result<u64, UntypedEr
         // for a caller to retype from, so this unsafe contract is
         // always satisfied here.
         ObjectType::AddressSpace => Ok(unsafe { paging::new_address_space() }.raw()),
-        ObjectType::Thread => Ok(register_thread(ThreadObject)),
+        ObjectType::Thread => Ok(register_thread(ThreadObject { task_index: None })),
         _ => unreachable!("checked above"),
     }
 }

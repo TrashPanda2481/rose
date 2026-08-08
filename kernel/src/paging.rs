@@ -97,6 +97,17 @@ impl AddressSpace {
     pub fn raw(&self) -> u64 {
         self.pml4_phys
     }
+
+    /// Rebuilds an AddressSpace handle from a raw PML4 physical address,
+    /// e.g. one previously obtained via `raw()` and stashed in a
+    /// Capability's `KernelObjectId`. Not unsafe: AddressSpace is just a
+    /// Copy handle, it does not own or map anything by itself, so
+    /// constructing one from an arbitrary u64 cannot corrupt state on
+    /// its own; whatever later dereferences the PML4 is where any
+    /// validity requirement actually lives.
+    pub fn from_raw(pml4_phys: u64) -> AddressSpace {
+        AddressSpace { pml4_phys }
+    }
 }
 
 /// Same value Limine reported via HhdmRequest. Set once by `build()`,

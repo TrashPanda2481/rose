@@ -226,6 +226,28 @@ extern "C" fn rose_exception_handler(frame: *mut InterruptFrame) {
             let result = syscall::dispatch_untyped(arg1, arg2, arg3);
             usermode::on_untyped_syscall(arg1, arg2, arg3, result);
             frame.regs.rax = result;
+        } else if syscall::is_configure_syscall(frame.regs.rax) {
+            let arg1 = frame.regs.rdi;
+            let arg2 = frame.regs.rsi;
+            let arg3 = frame.regs.rdx;
+            let arg4 = frame.regs.r10;
+            // Configure is the first syscall to need a 5th argument;
+            // r8 has been sitting in SavedRegs/common_stub the whole
+            // time (every branch above it just never had a reason to
+            // read it out), so no calling-convention or stub change is
+            // needed here, only reading one more field.
+            let arg5 = frame.regs.r8;
+            let result = syscall::dispatch_configure(arg1, arg2, arg3, arg4, arg5);
+            usermode::on_configure_syscall(arg1, arg2, arg3, arg4, arg5, result);
+            frame.regs.rax = result;
+        } else if syscall::is_frame_map_syscall(frame.regs.rax) {
+            let arg1 = frame.regs.rdi;
+            let arg2 = frame.regs.rsi;
+            let arg3 = frame.regs.rdx;
+            let arg4 = frame.regs.r10;
+            let result = syscall::dispatch_frame_map(arg1, arg2, arg3, arg4);
+            usermode::on_frame_map_syscall(arg1, arg2, arg3, arg4, result);
+            frame.regs.rax = result;
         } else {
             usermode::on_syscall(frame.regs.rax);
         }
