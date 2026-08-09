@@ -90,6 +90,47 @@ static SCHEDULER: SpinLock<Scheduler> = SpinLock::new(Scheduler {
 
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
 
+/// Reads the caller's current RFLAGS, clears IF, and returns the
+/// pre-cli flags so `restore_flags` can put things back exactly as
+/// they were. Used to bracket every SCHEDULER-locking critical section
+/// that isn't already known by construction to run at a single fixed
+/// IF state (unlike `set_current_address_space`/
+/// `set_current_kernel_stack`, each of which has exactly one caller
+/// confirmed to always run at IF=1, a blind cli/sti pair is correct
+/// and simpler there). `with_current_cspace`/`spawn`/`spawn_in`/
+/// `spawn_user` all have call sites at both IF=1 (normal ring-0 setup
+/// code, e.g. main.rs's boot-handoff grants) and IF=0 (from inside the
+/// vector-0x80 syscall interrupt gate, idt.rs, which clears IF for its
+/// whole handler) -- a blind `sti` in the IF=0 case would incorrectly
+/// re-enable interrupts mid-handler, before its own `iretq` restores
+/// the real saved state. Save-and-restore is correct for both cases
+/// without needing to know which one a given call is.
+#[inline(always)]
+unsafe fn save_flags_and_cli() -> u64 {
+    let flags: u64;
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "pop {}",
+            "cli",
+            out(reg) flags,
+        );
+    }
+    flags
+}
+
+/// Restores IF to whatever `save_flags_and_cli` observed -- `sti` only
+/// if the caller actually had interrupts enabled to begin with, a
+/// no-op otherwise. See `save_flags_and_cli`'s doc comment.
+#[inline(always)]
+unsafe fn restore_flags(flags: u64) {
+    if flags & (1 << 9) != 0 {
+        unsafe {
+            core::arch::asm!("sti");
+        }
+    }
+}
+
 /// Registers task 0 (the caller's own current execution context) as the
 /// first entry in the run queue. Safety: call exactly once, before any
 /// `spawn`, `tick`, or `yield_now`.
@@ -107,12 +148,20 @@ pub unsafe fn init() {
 }
 
 /// Allocates a stack for `entry` and adds it to the run queue, returning
-/// its index. Only safe to call during boot setup, before any of these
-/// tasks can actually be preempted: this takes indices/a lock on the
-/// `tasks` Vec, and a concurrent `tick()`/`yield_now()` reading `tasks`
-/// mid-push would be a data race with the Vec's own reallocation. Every
-/// spawn call in this kernel happens from `kernel_main` before any
-/// switch is possible, which satisfies that.
+/// its index.
+///
+/// SU1 fix: this doc comment used to claim it's "only safe to call
+/// during boot setup, before any of these tasks can actually be
+/// preempted" -- that was already false by the time
+/// `scheduled_address_space_selftest` started calling `spawn_in` well
+/// after `pic::init()`/`timer::init()` had enabled interrupts (see
+/// main.rs). Without a cli guard around the lock+push below, a real
+/// timer tick landing mid-critical-section made `tick()` spin forever
+/// on this same non-reentrant SCHEDULER lock from inside an
+/// interrupt-gate ISR -- a permanent hang, single core, nothing else
+/// could ever release it. `save_flags_and_cli`/`restore_flags` (same
+/// helper `with_current_cspace` uses) closes that window; safe to call
+/// with interrupts already on (the actual case today) or already off.
 pub fn spawn(entry: fn()) -> usize {
     spawn_in(entry, paging::kernel_address_space())
 }
@@ -168,15 +217,20 @@ pub fn spawn_in(entry: fn(), address_space: AddressSpace) -> usize {
         }
     }
 
-    let mut scheduler = SCHEDULER.lock();
-    scheduler.tasks.push(Task {
-        saved_rsp: sp,
-        _stack: Some(stack),
-        address_space,
-        kernel_stack_top: stack_top,
-        cspace: Box::new(CSpace::new()),
-    });
-    scheduler.tasks.len() - 1
+    let flags = unsafe { save_flags_and_cli() };
+    let index = {
+        let mut scheduler = SCHEDULER.lock();
+        scheduler.tasks.push(Task {
+            saved_rsp: sp,
+            _stack: Some(stack),
+            address_space,
+            kernel_stack_top: stack_top,
+            cspace: Box::new(CSpace::new()),
+        });
+        scheduler.tasks.len() - 1
+    };
+    unsafe { restore_flags(flags) };
+    index
 }
 
 /// Builds a brand-new task that lands directly in ring 3 on its first
@@ -222,27 +276,61 @@ pub fn spawn_user(
         }
     }
 
-    let mut scheduler = SCHEDULER.lock();
-    scheduler.tasks.push(Task {
-        saved_rsp: sp,
-        _stack: Some(stack),
-        address_space,
-        kernel_stack_top: stack_top,
-        cspace,
-    });
-    scheduler.tasks.len() - 1
+    // SU1-class fix, same reasoning as spawn_in: cli-guard the lock.
+    // spawn_user's one real caller (thread::configure, via
+    // dispatch_configure) runs from inside the vector-0x80 interrupt
+    // handler itself (IF already 0 there, a genuine interrupt gate),
+    // so this has to be save_flags_and_cli/restore_flags, not a blind
+    // cli/sti pair -- a blind `sti` here would incorrectly turn
+    // interrupts back on before the handler's own `iretq` restores
+    // the real saved state, same hazard `with_current_cspace` has.
+    let flags = unsafe { save_flags_and_cli() };
+    let index = {
+        let mut scheduler = SCHEDULER.lock();
+        scheduler.tasks.push(Task {
+            saved_rsp: sp,
+            _stack: Some(stack),
+            address_space,
+            kernel_stack_top: stack_top,
+            cspace,
+        });
+        scheduler.tasks.len() - 1
+    };
+    unsafe { restore_flags(flags) };
+    index
 }
 
 /// Runs `f` against whichever task is current at the moment of the
-/// call, i.e. the one that trapped in via the syscall path calling
-/// this. Locks the same SCHEDULER lock as tick()/yield_now(); safe to
-/// call from the syscall dispatch path since that only ever runs with
-/// interrupts enabled from ring 3 (not from inside tick()'s own
-/// already-locked section).
+/// call. Locks the same SCHEDULER lock as tick()/yield_now().
+///
+/// SU2 fix: called from two genuinely different interrupt contexts,
+/// which is exactly why this needs `save_flags_and_cli`/
+/// `restore_flags` rather than a blind cli/sti pair. From
+/// syscall.rs's dispatch_* functions, this runs from inside the
+/// vector-0x80 handler itself -- a real interrupt gate (idt.rs,
+/// `Entry::set_user`, type 0xE), so IF is already 0 for the whole
+/// handler regardless of the interrupted context's own saved rflags;
+/// a blind `sti` at the end here would incorrectly turn interrupts
+/// back on in the middle of that handler, before its own `iretq`
+/// restores the real saved state. From main.rs's boot-handoff
+/// `grant_root` calls, this runs as normal ring-0 code with IF=1
+/// already, well after `pic::init()`/`timer::init()` -- there,
+/// without cli, a real timer tick landing mid-critical-section would
+/// make `tick()` spin forever on this same non-reentrant SpinLock
+/// from inside an interrupt-gate ISR (IF stuck at 0), a permanent
+/// hang, since nothing else on this single core could ever release
+/// it. save_flags_and_cli/restore_flags is correct for both: it
+/// disables interrupts unconditionally for the critical section, then
+/// only re-enables them if they were actually on to begin with.
 pub fn with_current_cspace<R>(f: impl FnOnce(&mut CSpace) -> R) -> R {
-    let mut scheduler = SCHEDULER.lock();
-    let current = scheduler.current;
-    f(&mut scheduler.tasks[current].cspace)
+    let flags = unsafe { save_flags_and_cli() };
+    let result = {
+        let mut scheduler = SCHEDULER.lock();
+        let current = scheduler.current;
+        f(&mut scheduler.tasks[current].cspace)
+    };
+    unsafe { restore_flags(flags) };
+    result
 }
 
 /// Updates whichever task is current at the moment of the call to run
