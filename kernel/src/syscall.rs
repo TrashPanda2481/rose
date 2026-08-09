@@ -155,9 +155,22 @@ pub fn dispatch_untyped(arg1: u64, arg2: u64, arg3: u64) -> u64 {
     let dst_cptr = arg3 as u32;
 
     let result = scheduler::with_current_cspace(|cspace| -> Result<u64, RetypeFailure> {
+        // MEDIUM fix: gate Retype on Rights::WRITE, matching every
+        // other typed cap argument in this file (Configure checks
+        // GRANT/MAP on its three args, Frame-Map checks MAP/WRITE).
+        // Previously only object_type was checked, so mint-ing an
+        // Untyped cap down to Rights::NONE (the standard way to hand a
+        // narrowed-confinement view to a less-trusted delegate) had no
+        // effect on Retype -- the "rights bound what you can do with a
+        // cap" invariant held for every other object type but this
+        // one. WRITE matches the boot-handoff grant (full_rights =
+        // READ|WRITE|MAP), so this doesn't change behavior for any
+        // existing caller.
         let untyped_cap = cspace
             .lookup(untyped_cptr)
-            .filter(|cap| cap.object_type == ObjectType::Untyped)
+            .filter(|cap| {
+                cap.object_type == ObjectType::Untyped && cap.rights.contains(Rights::WRITE)
+            })
             .ok_or(RetypeFailure::Untyped(UntypedError::InvalidUntyped))?;
 
         let object_type = ObjectType::from_u8(arg2 as u8)
@@ -255,6 +268,21 @@ pub fn dispatch_configure(arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
                 })
                 .ok_or(ConfigureError::InvalidThread)?;
 
+            // MEDIUM fix ("verify before commit"): check the thread
+            // isn't already configured BEFORE the irreversible
+            // untyped::take_cspace call below. take_cspace removes its
+            // entry from CSPACE_OBJECTS on success with no way back;
+            // calling it before this check meant a second Configure
+            // against an already-configured thread, with a real
+            // CSpace cptr, silently destroyed the caller's CSpace even
+            // though the syscall reported failure. This same check
+            // also still runs inside thread::configure right before
+            // claim_thread, kept there too as the authoritative,
+            // closest-to-the-actual-commit guard -- this one exists so
+            // the failure is caught before take_cspace, not just
+            // before spawn_user.
+            untyped::peek_thread_unconfigured(thread_cap.object_ref.0)?;
+
             let as_cap = cspace
                 .lookup(as_cptr)
                 .filter(|cap| {
@@ -262,6 +290,16 @@ pub fn dispatch_configure(arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
                         && cap.rights.contains(Rights::MAP)
                 })
                 .ok_or(ConfigureError::InvalidAddressSpace)?;
+
+            let address_space = paging::AddressSpace::from_raw(as_cap.object_ref.0);
+
+            // CRITICAL fix: reject the kernel's own AddressSpace as a
+            // Configure target, same reasoning as Frame-Map's own
+            // check (see dispatch_frame_map). Scheduling a task to run
+            // against the kernel's live PML4 is never legitimate.
+            if address_space.is_kernel() {
+                return Err(ConfigureError::InvalidAddressSpace);
+            }
 
             let cspace_box = if cspace_cptr == 0 {
                 None
@@ -279,7 +317,6 @@ pub fn dispatch_configure(arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
                 )
             };
 
-            let address_space = paging::AddressSpace::from_raw(as_cap.object_ref.0);
             Ok((thread_cap.object_ref.0, address_space, cspace_box))
         },
     );
@@ -309,6 +346,18 @@ pub enum MapError {
     /// an unaligned value could actually arrive from outside the
     /// kernel's own control.
     Misaligned,
+    /// `vaddr` falls in the PML4 range every AddressSpace shares BY
+    /// PHYSICAL REFERENCE with the kernel's own tables (see
+    /// `paging::is_shared_vaddr`). Mapping there from ANY AddressSpace
+    /// writes into the same shared page-table structures the kernel
+    /// itself runs from and every other AddressSpace also sees.
+    VaddrNotPrivate,
+    /// The AddressSpace cptr resolved to the kernel's own AddressSpace.
+    /// Never a valid Frame-Map/Configure target: even a vaddr outside
+    /// the shared range would still be writing into the kernel's own
+    /// live PML4's private half, which nothing else populates today
+    /// but is still the same page tables the kernel runs from.
+    AddressSpaceIsKernel,
 }
 
 impl MapError {
@@ -319,6 +368,8 @@ impl MapError {
             MapError::InvalidFrame => 1,
             MapError::InvalidAddressSpace => 2,
             MapError::Misaligned => 3,
+            MapError::VaddrNotPrivate => 4,
+            MapError::AddressSpaceIsKernel => 5,
         }
     }
 }
@@ -345,13 +396,16 @@ fn encode_map(result: Result<(), MapError>) -> u64 {
 /// address space until some future Frame.Map syscall populates it").
 ///
 /// Always adds PAGE_USER: this syscall exists to populate a target
-/// AddressSpace with user-mapped pages, not to let a task remap its
-/// own kernel-AddressSpace cap (slot1 in the self-test) with
-/// different permissions. There's no legitimate use for a kernel-
-/// target mapping through this path yet, and forcing PAGE_USER here
-/// is cheaper than adding a whole "is this AddressSpace the kernel's
-/// own" permission model this early. Revisit if a real use for
-/// kernel-target mapping via capability ever shows up.
+/// AddressSpace with user-mapped pages, not to let a task remap the
+/// kernel's own tables. Originally the only guard against a
+/// kernel-target mapping; superseded (not removed -- still correct
+/// for what it does) by two explicit checks below after an audit
+/// found PAGE_USER alone doesn't stop a task from targeting the
+/// kernel's own AddressSpace or its shared upper half: `vaddr` is
+/// rejected outright if it falls in the shared range
+/// (`paging::is_shared_vaddr`), and the target AddressSpace is
+/// rejected outright if it's the kernel's own
+/// (`AddressSpace::is_kernel`). See docs/cores/kernel/BUGS.md.
 pub fn dispatch_frame_map(arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
     let frame_cptr = arg1 as u32;
     let as_cptr = arg2 as u32;
@@ -377,6 +431,28 @@ pub fn dispatch_frame_map(arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
             return Err(MapError::Misaligned);
         }
 
+        // CRITICAL fix: reject any vaddr in the range every
+        // AddressSpace shares BY PHYSICAL REFERENCE with the kernel's
+        // own tables. Without this, a task holding only the default
+        // rights `retype` already grants (any Frame cap, any
+        // AddressSpace cap) could map an attacker-chosen frame
+        // directly over kernel .text -- with PAGE_USER set, executable
+        // -- from ring 3. See docs/cores/kernel/BUGS.md.
+        if paging::is_shared_vaddr(vaddr) {
+            return Err(MapError::VaddrNotPrivate);
+        }
+
+        let address_space = paging::AddressSpace::from_raw(as_cap.object_ref.0);
+
+        // CRITICAL fix, independent of the vaddr check above: reject
+        // the kernel's own AddressSpace as a target outright. The
+        // vaddr check alone doesn't stop a task from mapping into the
+        // kernel AddressSpace's own PRIVATE (index<256) half -- still
+        // the exact same PML4 the kernel itself runs from.
+        if address_space.is_kernel() {
+            return Err(MapError::AddressSpaceIsKernel);
+        }
+
         // Requesting a writable mapping out of a Frame cap that was
         // never granted WRITE would let a read-only capability become
         // writable memory just by picking a flag bit; reject it the
@@ -390,11 +466,18 @@ pub fn dispatch_frame_map(arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
         if flag_bits & MAP_FLAG_WRITABLE != 0 {
             flags |= paging::PAGE_WRITABLE;
         }
-        if flag_bits & MAP_FLAG_NO_EXECUTE != 0 {
+        // HIGH fix (W^X): a writable mapping is never also executable
+        // through this syscall, regardless of whether the caller
+        // separately asked for MAP_FLAG_NO_EXECUTE. Previously the two
+        // flag bits were independent, so MAP_FLAG_WRITABLE alone
+        // produced a page that was simultaneously writable and
+        // executable -- the exact policy paging::build()'s own kernel-
+        // image mapping documents itself as enforcing "from the very
+        // first kernel-owned page table".
+        if flag_bits & MAP_FLAG_NO_EXECUTE != 0 || flag_bits & MAP_FLAG_WRITABLE != 0 {
             flags |= paging::PAGE_NO_EXECUTE;
         }
 
-        let address_space = paging::AddressSpace::from_raw(as_cap.object_ref.0);
         unsafe { address_space.map_page(vaddr, frame_cap.object_ref.0, flags) };
         Ok(())
     });

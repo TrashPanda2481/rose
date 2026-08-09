@@ -108,6 +108,23 @@ impl AddressSpace {
     pub fn from_raw(pml4_phys: u64) -> AddressSpace {
         AddressSpace { pml4_phys }
     }
+
+    /// True if this AddressSpace is the kernel's own (the one built by
+    /// `init()` and returned by `kernel_address_space()`). Used by the
+    /// Frame-Map and Configure syscalls to reject a caller-supplied
+    /// AddressSpace cap that resolves to the kernel's live page
+    /// tables. `is_shared_vaddr` alone doesn't cover this case: it
+    /// stops a write into the shared upper half from ANY AddressSpace,
+    /// but says nothing about writing into the kernel AddressSpace's
+    /// own PRIVATE (index<256) half, which nothing else populates
+    /// today but is still the exact same PML4 the kernel runs from.
+    /// See docs/cores/kernel/BUGS.md.
+    pub fn is_kernel(&self) -> bool {
+        self.pml4_phys
+            == KERNEL_PML4
+                .lock()
+                .expect("rose: AddressSpace::is_kernel before paging::init")
+    }
 }
 
 /// Same value Limine reported via HhdmRequest. Set once by `build()`,
@@ -145,6 +162,19 @@ fn index(virt: u64, level: u8) -> usize {
     ((virt >> (12 + 9 * level as u64)) & 0x1FF) as usize
 }
 
+/// True if `virt`'s PML4 index falls in SHARED_PML4_RANGE, the range
+/// every AddressSpace shares BY PHYSICAL REFERENCE with the kernel's
+/// own tables (see `new_address_space`). Mapping through this range
+/// from ANY AddressSpace writes into the SAME shared physical
+/// page-table structures the kernel itself executes from and every
+/// other AddressSpace also sees -- not a copy, the literal same PDPT/
+/// PD/PT frames. Used by the Frame-Map syscall to reject a
+/// caller-supplied vaddr before it ever reaches `map_page`. See
+/// docs/cores/kernel/BUGS.md for the vulnerability this closes.
+pub fn is_shared_vaddr(virt: u64) -> bool {
+    SHARED_PML4_RANGE.contains(&index(virt, 3))
+}
+
 /// Returns the physical address of the next-level table pointed to by the
 /// entry at `idx`, allocating and zeroing a fresh one if it isn't present
 /// yet. Intermediate levels are always PRESENT|WRITABLE|USER; permissions
@@ -161,6 +191,24 @@ fn index(virt: u64, level: u8) -> usize {
 unsafe fn next_level(table: &mut PageTable, idx: usize) -> u64 {
     let entry = table.0[idx];
     if entry & PAGE_PRESENT != 0 {
+        // CRITICAL fix: a present PD-level entry with PAGE_HUGE set is
+        // a 2MiB leaf, not a pointer to a PT. Reinterpreting its
+        // address bits as a table and writing an 8-byte PTE into
+        // `table_at(that address)` silently corrupts whatever real
+        // RAM that huge page backs (most of HHDM is huge-mapped, see
+        // map_hhdm_range) at an offset the caller controls. Only the
+        // shared kernel/HHDM range is huge-mapped today, and
+        // syscall.rs's Frame-Map dispatch now rejects any caller
+        // vaddr in that range before ever reaching here (see
+        // paging::is_shared_vaddr) -- this assert is the second,
+        // structural line of defense: it should be unreachable by
+        // construction, and if it's ever hit anyway, halting loudly
+        // beats corrupting memory silently. See docs/cores/kernel/BUGS.md.
+        assert!(
+            entry & PAGE_HUGE == 0,
+            "rose: paging: next_level walked into a huge-page leaf (index {idx}) \
+             instead of a page table -- vaddr collided with an existing 2MiB mapping"
+        );
         entry & ADDR_MASK
     } else {
         let new_phys = alloc_zeroed_table();
