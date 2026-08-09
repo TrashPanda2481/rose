@@ -17,6 +17,7 @@ Track every main → stable merge here. Newest first.
 ```
 Date        Commit      What it proves works
 ----        ------      ---------------------
+2026-08-09  a683694     Security audit fixes: Frame-Map ring-3 privilege escalation, W^X bypass, huge-page walk assert, scheduler lock ordering (deadlock risk), Configure commit-before-verify, Untyped rights check. Verified end to end on QEMU (BIOS+UEFI) and Oracle VM VirtualBox.
 2026-08-08  a7750e9     PCI enumeration v0.1, Frame-Map syscall (fixes Configure page-fault bug), and per-task kernel entry stacks (fixes post-syscall page-fault bug), verified end to end on QEMU (BIOS+UEFI) and Oracle VM VirtualBox.
 2026-08-01  44903de     Retype extended to AddressSpace and Thread (six-step ring-3 self-test), verified end to end on QEMU (BIOS) and Oracle VM VirtualBox.
 2026-08-01  93a2fc5     Capabilities/CSpace v0.1, CSpace syscalls, Untyped/Retype v0.1, and the task 0 address-space sync fix, verified end to end on QEMU (BIOS+UEFI) and Oracle VM VirtualBox.
