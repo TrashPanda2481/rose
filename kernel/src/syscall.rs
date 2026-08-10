@@ -13,6 +13,7 @@
 // an error whose magnitude is the CSpaceError code.
 
 use crate::cspace::{CSpace, CSpaceError};
+use crate::endpoint::{self, EndpointError, Message};
 use crate::mem;
 use crate::paging;
 use crate::scheduler;
@@ -28,6 +29,8 @@ pub const SYS_CSPACE_REVOKE: u64 = 0x1003;
 pub const SYS_UNTYPED_RETYPE: u64 = 0x1004;
 pub const SYS_THREAD_CONFIGURE: u64 = 0x1005;
 pub const SYS_FRAME_MAP: u64 = 0x1006;
+pub const SYS_ENDPOINT_SEND: u64 = 0x1007;
+pub const SYS_ENDPOINT_RECEIVE: u64 = 0x1008;
 
 /// Frame-Map's own flags argument: a small, clean bitfield instead of
 /// raw hardware PTE bits. paging.rs's PAGE_* constants are an
@@ -73,6 +76,25 @@ pub fn is_configure_syscall(num: u64) -> bool {
 /// ConfigureError.
 pub fn is_frame_map_syscall(num: u64) -> bool {
     num == SYS_FRAME_MAP
+}
+
+/// True if `num` is the Endpoint-Send syscall. Own predicate/dispatch
+/// pair, same reasoning as `is_frame_map_syscall` above: EndpointError
+/// is its own small enum, unrelated to CSpaceError/UntypedError/
+/// ConfigureError/MapError.
+pub fn is_endpoint_send_syscall(num: u64) -> bool {
+    num == SYS_ENDPOINT_SEND
+}
+
+/// True if `num` is the Endpoint-Receive syscall. Separate from
+/// `is_endpoint_send_syscall` even though both dispatch through the
+/// same EndpointError: idt.rs's own dispatch chain needs to route
+/// Receive to a call that writes back three output registers
+/// (rsi/rdx/r10), not just one (rax) like every syscall before it, so
+/// it needs a syscall-number check specific to Receive to decide
+/// which shape of call to make.
+pub fn is_endpoint_receive_syscall(num: u64) -> bool {
+    num == SYS_ENDPOINT_RECEIVE
 }
 
 /// Maps a CSpace op's Result onto the single-register return
@@ -207,6 +229,14 @@ pub fn dispatch_untyped(arg1: u64, arg2: u64, arg3: u64) -> u64 {
             ObjectType::CSpace => Rights::GRANT,
             ObjectType::AddressSpace => Rights::MAP,
             ObjectType::Thread => Rights::GRANT,
+            // Endpoint gets both SEND and RECEIVE on a fresh retype:
+            // there's no source cap of the same type to narrow rights
+            // from (same "brand new object" reasoning as every other
+            // arm here), and the self-test's own on_untyped_syscall
+            // hook is what narrows the copy it grants into the second
+            // task's CSpace down to RECEIVE only, via
+            // `untyped::grant_into_cspace` -- not this match arm.
+            ObjectType::Endpoint => Rights::SEND.union(Rights::RECEIVE),
             _ => unreachable!("untyped::retype already rejected every other ObjectType"),
         };
         let new_cap = Capability {
@@ -483,4 +513,90 @@ pub fn dispatch_frame_map(arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
     });
 
     encode_map(result)
+}
+
+/// Maps an EndpointError onto the single-register return convention.
+/// +40 offset: the next free band after CSpaceError's bare 1-4,
+/// UntypedError's +10 (11-13), ConfigureError's +20 (21-24), and
+/// MapError's +30 (31-35), same non-colliding-band convention as
+/// every earlier `encode_*` function's own comment.
+fn encode_endpoint_error(e: EndpointError) -> u64 {
+    (-(e.code() as i64 + 40)) as u64
+}
+
+/// Runs Endpoint-Send against the calling task's own CSpace. Argument
+/// meaning: arg1=endpoint cptr, arg2=label, arg3=data0, arg4=data1.
+/// Returns 0 on success (rax only; Send never hands back a value
+/// beyond success/failure), negative EndpointError on failure.
+///
+/// Two-phase, same reasoning as `dispatch_configure`'s own comment:
+/// the cap lookup/rights check happens inside a single
+/// `with_current_cspace` call, and `endpoint::send` -- which may call
+/// `scheduler::block_current_and_switch`, itself taking the same
+/// SCHEDULER lock `with_current_cspace` is already holding for the
+/// duration of its own closure -- only runs after that closure
+/// returns. Calling it from inside the closure would be a
+/// self-deadlock against a non-reentrant spinlock, not just untidy
+/// nesting.
+pub fn dispatch_endpoint_send(arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
+    let endpoint_cptr = arg1 as u32;
+    let label = arg2 as u32;
+    let data0 = arg3;
+    let data1 = arg4;
+
+    let looked_up = scheduler::with_current_cspace(|cspace| {
+        cspace
+            .lookup(endpoint_cptr)
+            .filter(|cap| {
+                cap.object_type == ObjectType::Endpoint && cap.rights.contains(Rights::SEND)
+            })
+            .map(|cap| cap.object_ref.0)
+    });
+
+    let Some(endpoint_id) = looked_up else {
+        return encode_endpoint_error(EndpointError::InvalidEndpoint);
+    };
+
+    let message = Message {
+        label,
+        data0,
+        data1,
+    };
+    match endpoint::send(endpoint_id, message) {
+        Ok(()) => 0,
+        Err(e) => encode_endpoint_error(e),
+    }
+}
+
+/// Runs Endpoint-Receive against the calling task's own CSpace.
+/// Argument meaning: arg1=endpoint cptr. Unlike every syscall above,
+/// this is the first one that hands back more than a single value on
+/// success: the returned tuple is (rax, rsi, rdx, r10) exactly as
+/// idt.rs's dispatch chain needs to write them back into the trapped
+/// frame -- rax=0/error, rsi=label, rdx=data0, r10=data1 (0s on
+/// failure, not meaningful).
+///
+/// Same two-phase reasoning as `dispatch_endpoint_send` above: the cap
+/// lookup happens inside `with_current_cspace`; `endpoint::receive`
+/// (which may block) runs only after that closure returns.
+pub fn dispatch_endpoint_receive(arg1: u64) -> (u64, u64, u64, u64) {
+    let endpoint_cptr = arg1 as u32;
+
+    let looked_up = scheduler::with_current_cspace(|cspace| {
+        cspace
+            .lookup(endpoint_cptr)
+            .filter(|cap| {
+                cap.object_type == ObjectType::Endpoint && cap.rights.contains(Rights::RECEIVE)
+            })
+            .map(|cap| cap.object_ref.0)
+    });
+
+    let Some(endpoint_id) = looked_up else {
+        return (encode_endpoint_error(EndpointError::InvalidEndpoint), 0, 0, 0);
+    };
+
+    match endpoint::receive(endpoint_id) {
+        Ok(message) => (0, message.label as u64, message.data0, message.data1),
+        Err(e) => (encode_endpoint_error(e), 0, 0, 0),
+    }
 }

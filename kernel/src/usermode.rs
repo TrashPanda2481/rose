@@ -20,9 +20,11 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::gdt;
 use crate::serial;
 use crate::syscall::{
-    SYS_CSPACE_COPY, SYS_CSPACE_MINT, SYS_CSPACE_MOVE, SYS_CSPACE_REVOKE, SYS_FRAME_MAP,
-    SYS_THREAD_CONFIGURE, SYS_UNTYPED_RETYPE,
+    SYS_CSPACE_COPY, SYS_CSPACE_MINT, SYS_CSPACE_MOVE, SYS_CSPACE_REVOKE, SYS_ENDPOINT_RECEIVE,
+    SYS_ENDPOINT_SEND, SYS_FRAME_MAP, SYS_THREAD_CONFIGURE, SYS_UNTYPED_RETYPE,
 };
+use crate::untyped;
+use abi::{Capability, KernelObjectId, ObjectType, Rights};
 
 // Hand-written user-mode machine code, not compiled Rust: there's no
 // user-mode runtime (no allocator, no panic handler, nothing) for a
@@ -59,18 +61,33 @@ use crate::syscall::{
 //   7.  RETYPE slot6 -> slot7,  Frame        (1)                 -> ok
 //   8.  RETYPE slot6 -> slot8,  CSpace       (9)                 -> ok
 //   9.  RETYPE slot6 -> slot9,  AddressSpace (3)                 -> ok
-// Extended past the AddressSpace retype with two Frame-Map steps,
-// the actual fix for the Configure page-fault bug (see BUGS.md): the
+// Extended past the AddressSpace retype with an Endpoint retype,
+// Endpoint IPC increment 1's own self-test step, cross-checked
+// against on_untyped_syscall's UNTYPED_SYSCALL_STEPS table below
+// (now seven rows, this one inserted at index 3):
+//   10. RETYPE slot15 -> slot16, Endpoint (5), expect ok. Uses a
+//       dedicated 1-frame Untyped pool granted at slot15 by main.rs's
+//       usermode_selftest, separate from slot6's own 4-frame pool
+//       (which steps 13-14 below deliberately exhaust; sharing a pool
+//       would disturb that arithmetic). on_untyped_syscall's own
+//       side-effect hook grants a RECEIVE-only copy of the resulting
+//       Endpoint cap into slot8's CSpace object (the CSpace retyped
+//       in step 8, still unclaimed at this point; see
+//       untyped::grant_into_cspace) at that CSpace's own slot 1, so
+//       program2's task inherits it once Configure (step 16 below)
+//       claims that CSpace.
+// Extended past the Endpoint retype with two Frame-Map steps, the
+// actual fix for the Configure page-fault bug (see BUGS.md): the
 // second program's code/stack were previously mapped only into
 // user_as, a *different* AddressSpace object than the fresh one
 // slot9 points to, so the task Configure spawned against slot9
 // faulted on its very first instruction. Cross-checked against
 // on_frame_map_syscall's MAP_SYSCALL_STEPS table below:
-//   10. MAP    frame slot7  -> as slot9 @ 0xa00000 (STACK2_VADDR),
+//   11. MAP    frame slot7  -> as slot9 @ 0xa00000 (STACK2_VADDR),
 //       flags=WRITABLE|NO_EXECUTE (3) (reuses the Frame retyped in
 //       step 7 above, which nothing had used until now; a fresh
 //       zeroed frame is exactly correct for a stack)          -> ok
-//   11. MAP    frame slot13 -> as slot9 @ 0x800000 (CODE2_VADDR),
+//   12. MAP    frame slot13 -> as slot9 @ 0x800000 (CODE2_VADDR),
 //       flags=0 (R+X, no WRITABLE) (slot13: a pre-populated root
 //       Frame cap over program2's actual instruction bytes, granted
 //       by main.rs's usermode_selftest ahead of time, same
@@ -79,17 +96,34 @@ use crate::syscall::{
 //       write frame contents via syscalls)                    -> ok
 // Extended past the two Map steps with the remaining three Retype
 // steps (unchanged target slots, just resequenced after Map):
-//   12. RETYPE slot6 -> slot10, Thread       (4) (pool now empty) -> ok
-//   13. RETYPE slot6 -> slot11, Frame        (1) (pool empty)     -> Exhausted
-//   14. RETYPE slot6 -> slot12, PageTable    (2) (not retypeable) -> UnsupportedType
-// Extended past the fourteen Retype/Map steps with one Configure
+//   13. RETYPE slot6 -> slot10, Thread       (4) (pool now empty) -> ok
+//   14. RETYPE slot6 -> slot11, Frame        (1) (pool empty)     -> Exhausted
+//   15. RETYPE slot6 -> slot12, PageTable    (2) (not retypeable) -> UnsupportedType
+// Extended past the fifteen Retype/Map steps with one Configure
 // step, cross-checked against on_configure_syscall's
 // CONFIGURE_SYSCALL_STEPS table below:
-//   15. CONFIGURE slot10 (Thread, from step 12) as=slot9 (AddressSpace,
-//       from step 9), cspace=0 (fresh), entry=0x800000, stack_top=
-//       0xa01000 (second program's code/stack pages, now actually
-//       mapped into slot9 itself by steps 10/11 above, not just into
-//       user_as)                                                -> ok
+//   16. CONFIGURE slot10 (Thread, from step 13) as=slot9 (AddressSpace,
+//       from step 9), cspace=8 (the CSpace retyped in step 8, now
+//       carrying the RECEIVE-only Endpoint cap on_untyped_syscall
+//       pre-populated at its own slot 1; previously 0/fresh, before
+//       this feature), entry=0x800000, stack_top=0xa01000 (second
+//       program's code/stack pages, now actually mapped into slot9
+//       itself by steps 11/12 above, not just into user_as)     -> ok
+// Extended past the Configure step with one Send step, Endpoint IPC
+// increment 1's own final step, cross-checked against
+// on_endpoint_send_syscall's own single-row table below:
+//   17. SEND on slot16 (the Endpoint retyped in step 10), label=
+//       0x1234, data0=0xdead, data1=0xbeef. Runs immediately after
+//       Configure, before program2's task (spawned by that same
+//       Configure call) has executed at all, so no receiver is
+//       parked yet: this always takes Send's blocking path (see
+//       endpoint.rs's own doc comment), parking task0 here until
+//       program2's own Receive step (below) finds it and wakes it
+//       back up. Because of that, on_endpoint_send_syscall's own hook,
+//       not on_configure_syscall's, despite Configure being the
+//       program-order-last step in this ring-3 program's own text,
+//       is provably the last self-test hook to actually fire; see its
+//       own doc comment for why the aggregate report lives there now.
 core::arch::global_asm!(
     ".section .rodata.user_program, \"a\"",
     ".global user_program_start",
@@ -151,7 +185,15 @@ core::arch::global_asm!(
     "mov rdx, 9",
     "mov rax, 0x1004",
     "int 0x80",
-    // 10: MAP frame slot7 -> as slot9 @ 0xa00000 (STACK2_VADDR),
+    // 10: RETYPE slot15 -> slot16, Endpoint (5), expect ok. Uses the
+    // dedicated 1-frame Untyped pool at slot15 (main.rs's
+    // usermode_selftest), separate from slot6's own 4-frame pool.
+    "mov rdi, 15",
+    "mov rsi, 5",
+    "mov rdx, 16",
+    "mov rax, 0x1004",
+    "int 0x80",
+    // 11: MAP frame slot7 -> as slot9 @ 0xa00000 (STACK2_VADDR),
     // flags=3 (WRITABLE|NO_EXECUTE), expect ok. Reuses the Frame
     // retyped in step 7 above; a fresh zeroed frame is exactly
     // correct for a stack.
@@ -161,7 +203,7 @@ core::arch::global_asm!(
     "mov r10, 3",
     "mov rax, 0x1006",
     "int 0x80",
-    // 11: MAP frame slot13 -> as slot9 @ 0x800000 (CODE2_VADDR),
+    // 12: MAP frame slot13 -> as slot9 @ 0x800000 (CODE2_VADDR),
     // flags=0 (R+X, no WRITABLE), expect ok. slot13 is a pre-
     // populated root Frame cap over program2's real instruction
     // bytes, granted ahead of time by main.rs's usermode_selftest.
@@ -171,37 +213,48 @@ core::arch::global_asm!(
     "mov r10, 0",
     "mov rax, 0x1006",
     "int 0x80",
-    // 12: RETYPE slot6 -> slot10, Thread (4), expect ok (pool of 4
-    // frames now fully spent by steps 7 through 12)
+    // 13: RETYPE slot6 -> slot10, Thread (4), expect ok (pool of 4
+    // frames now fully spent by steps 7 through 13)
     "mov rdi, 6",
     "mov rsi, 4",
     "mov rdx, 10",
     "mov rax, 0x1004",
     "int 0x80",
-    // 13: RETYPE slot6 -> slot11, Frame (1), expect Exhausted (pool
-    // already spent by steps 7 through 12)
+    // 14: RETYPE slot6 -> slot11, Frame (1), expect Exhausted (pool
+    // already spent by steps 7 through 13)
     "mov rdi, 6",
     "mov rsi, 1",
     "mov rdx, 11",
     "mov rax, 0x1004",
     "int 0x80",
-    // 14: RETYPE slot6 -> slot12, PageTable (2), expect UnsupportedType
+    // 15: RETYPE slot6 -> slot12, PageTable (2), expect UnsupportedType
     // (deliberately not retypeable, see untyped.rs module doc)
     "mov rdi, 6",
     "mov rsi, 2",
     "mov rdx, 12",
     "mov rax, 0x1004",
     "int 0x80",
-    // 15: CONFIGURE slot10 (Thread) as=slot9 (AddressSpace), cspace=0
-    // (fresh), entry=0x800000, stack_top=0xa01000 (second program's
-    // code/stack, now actually mapped into slot9 itself by steps
-    // 10/11 above, not just into user_as)
+    // 16: CONFIGURE slot10 (Thread) as=slot9 (AddressSpace), cspace=8
+    // (the CSpace retyped in step 8, now carrying a RECEIVE-only
+    // Endpoint cap on_untyped_syscall pre-populated at its own slot 1),
+    // entry=0x800000, stack_top=0xa01000 (second program's code/stack,
+    // now actually mapped into slot9 itself by steps 11/12 above, not
+    // just into user_as)
     "mov rdi, 10",
     "mov rsi, 9",
-    "mov rdx, 0",
+    "mov rdx, 8",
     "mov r10, 0x800000",
     "mov r8, 0xa01000",
     "mov rax, 0x1005",
+    "int 0x80",
+    // 17: SEND on slot16 (the Endpoint retyped in step 10), label=
+    // 0x1234, data0=0xdead, data1=0xbeef. Blocks: program2's own
+    // Receive step (see user_program2 below) hasn't run yet.
+    "mov rdi, 16",
+    "mov rsi, 0x1234",
+    "mov rdx, 0xdead",
+    "mov r10, 0xbeef",
+    "mov rax, 0x1007",
     "int 0x80",
     "2:",
     "jmp 2b",
@@ -209,18 +262,29 @@ core::arch::global_asm!(
     ".previous",
 );
 
-// Second, much smaller ring-3 program: what step 13 above actually
+// Second, much smaller ring-3 program: what step 16 above actually
 // launches via Configure, into a brand-new task rather than via
-// enter_user_mode. Only job is to prove it got there at all: one
+// enter_user_mode. First job is to prove it got there at all: one
 // syscall trap, using the pre-existing legacy sentinel value (1)
 // rather than inventing a new tracking table just for a liveness
 // check, so on_syscall's own counter/log is the proof this ran.
+// Second job, added for Endpoint IPC increment 1: RECEIVE on slot1,
+// the RECEIVE-only Endpoint cap on_untyped_syscall's own hook
+// pre-populated into this task's CSpace (retyped at slot8 in step 8
+// above, claimed by this task via Configure's own cspace=8 arg).
+// This always finds task0 already parked on its own Send (step 17
+// above ran first, before this task was even schedulable), so it
+// takes the immediate delivery-in-place path (see endpoint.rs) and
+// wakes task0 back up rather than blocking itself.
 core::arch::global_asm!(
     ".section .rodata.user_program2, \"a\"",
     ".global user_program2_start",
     ".global user_program2_end",
     "user_program2_start:",
     "mov rax, 1",
+    "int 0x80",
+    "mov rdi, 1",
+    "mov rax, 0x1008",
     "int 0x80",
     "2:",
     "jmp 2b",
@@ -386,13 +450,26 @@ enum ExpectedOutcome {
 static UNTYPED_SYSCALL_STEP: AtomicU64 = AtomicU64::new(0);
 static UNTYPED_SYSCALL_ALL_OK: AtomicBool = AtomicBool::new(true);
 
-/// One row per syscall in the fixed six-step Retype sequence
+/// CSPACE_OBJECTS registry index of the CSpace retyped at slot8 in
+/// step 8 of the self-test sequence, captured from that step's own
+/// successful result (the registry index IS the retype's return
+/// value, see untyped.rs's `retype`). Needed later, at step 3 (index)
+/// below, to grant the freshly retyped Endpoint's RECEIVE-only copy
+/// into that CSpace rather than into task0's own; u64::MAX is not a
+/// valid registry index and marks "not yet captured".
+static SLOT8_CSPACE_REGISTRY_ID: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// One row per syscall in the fixed seven-step Retype sequence
 /// appended to the ring-3 program above, run immediately after the
 /// six CSpace steps; index must line up with call order exactly.
-const UNTYPED_SYSCALL_STEPS: [(&str, ExpectedOutcome); 6] = [
+/// Extended past the original six rows with an Endpoint retype at
+/// index 3 (between AddressSpace and Thread) for Endpoint IPC
+/// increment 1; the three rows after it are otherwise unchanged.
+const UNTYPED_SYSCALL_STEPS: [(&str, ExpectedOutcome); 7] = [
     ("retype slot6->slot7 Frame", ExpectedOutcome::Success),
     ("retype slot6->slot8 CSpace", ExpectedOutcome::Success),
     ("retype slot6->slot9 AddressSpace", ExpectedOutcome::Success),
+    ("retype slot15->slot16 Endpoint", ExpectedOutcome::Success),
     (
         "retype slot6->slot10 Thread (pool now empty)",
         ExpectedOutcome::Success,
@@ -408,13 +485,22 @@ const UNTYPED_SYSCALL_STEPS: [(&str, ExpectedOutcome); 6] = [
 ];
 
 /// Called from idt.rs's rose_exception_handler for every `int 0x80`
-/// carrying the Retype syscall number. Verifies each of the six
+/// carrying the Retype syscall number. Verifies each of the seven
 /// against UNTYPED_SYSCALL_STEPS in order and, once the last one
 /// lands, prints the aggregated verdict and halts for good. This is
 /// now the true final halt for the whole boot self-test chain (see
 /// on_cspace_syscall's own comment on why its old halt moved here):
 /// the CSpace sequence falls straight through into this one, and this
 /// one's halt is what actually stops the CPU.
+///
+/// Two of the seven steps have side effects beyond verification, for
+/// Endpoint IPC increment 1: step 1 (the CSpace retype) stashes its
+/// own registry-index result into SLOT8_CSPACE_REGISTRY_ID, and step
+/// 3 (the new Endpoint retype) uses that stashed id to grant a
+/// RECEIVE-only copy of the freshly minted Endpoint into that
+/// CSpace's own slot 1, via untyped::grant_into_cspace. Both run
+/// after the existing ok/FAILED check below so a failed retype never
+/// feeds a bogus id or object into the grant.
 pub fn on_untyped_syscall(arg1: u64, arg2: u64, arg3: u64, result: u64) {
     let mut com1 = serial::Serial::init();
     let step = UNTYPED_SYSCALL_STEP.fetch_add(1, Ordering::Relaxed);
@@ -439,6 +525,43 @@ pub fn on_untyped_syscall(arg1: u64, arg2: u64, arg3: u64, result: u64) {
     };
     if !ok {
         UNTYPED_SYSCALL_ALL_OK.store(false, Ordering::Relaxed);
+    }
+
+    if ok && step == 1 {
+        // Step 1 (index): retype slot6->slot8 CSpace. Stash the
+        // registry index for step 3's own grant_into_cspace call.
+        SLOT8_CSPACE_REGISTRY_ID.store(result, Ordering::Relaxed);
+    }
+    if ok && step == 3 {
+        // Step 3 (index): retype slot15->slot16 Endpoint. Grant a
+        // RECEIVE-only copy into slot8's CSpace (captured just above,
+        // two steps ago) at that CSpace's own slot 1, so program2's
+        // task inherits it once Configure claims that CSpace.
+        let cspace_id = SLOT8_CSPACE_REGISTRY_ID.load(Ordering::Relaxed);
+        let receive_cap = Capability {
+            object_ref: KernelObjectId(result),
+            object_type: ObjectType::Endpoint,
+            rights: Rights::RECEIVE,
+            badge: 0,
+        };
+        match untyped::grant_into_cspace(cspace_id, 1, receive_cap) {
+            Ok(()) => {
+                let _ = writeln!(
+                    com1,
+                    "rose: untyped syscall self-test: granted RECEIVE-only endpoint cap into cspace {} slot1, ok",
+                    cspace_id
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    com1,
+                    "rose: untyped syscall self-test: grant_into_cspace(cspace={}, slot=1) FAILED, code={}",
+                    cspace_id,
+                    e.code()
+                );
+                UNTYPED_SYSCALL_ALL_OK.store(false, Ordering::Relaxed);
+            }
+        }
     }
 
     let _ = writeln!(
@@ -562,9 +685,11 @@ const CONFIGURE_SYSCALL_STEPS: [(&str, ExpectedOutcome); 1] = [(
 
 /// Called from idt.rs's rose_exception_handler for every `int 0x80`
 /// carrying the Configure syscall number. Verifies the single step
-/// against CONFIGURE_SYSCALL_STEPS and, once it lands, prints the
-/// full aggregated verdict across all three syscall families
-/// (CSpace, Retype, Configure).
+/// against CONFIGURE_SYSCALL_STEPS. The full cross-family aggregated
+/// verdict used to be printed here once this step landed; it moved to
+/// on_endpoint_send_syscall below for Endpoint IPC increment 1 (see
+/// that function's own doc comment for why it, not this one, is now
+/// provably the last hook to fire).
 ///
 /// Deliberately still no halt here, unlike on_cspace_syscall's and
 /// on_untyped_syscall's now-retired ones: Configure just made a
@@ -616,25 +741,176 @@ pub fn on_configure_syscall(arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u6
     );
 
     if step + 1 >= CONFIGURE_SYSCALL_STEPS.len() as u64 {
-        let cspace_ok = CSPACE_SYSCALL_ALL_OK.load(Ordering::Relaxed);
-        let untyped_ok = UNTYPED_SYSCALL_ALL_OK.load(Ordering::Relaxed);
-        let map_ok = MAP_SYSCALL_ALL_OK.load(Ordering::Relaxed);
         let configure_ok = CONFIGURE_SYSCALL_ALL_OK.load(Ordering::Relaxed);
         let _ = writeln!(
             com1,
             "rose: configure syscall self-test: sequence complete, overall {}",
             if configure_ok { "confirmed" } else { "FAILED" }
         );
+        // No cross-family aggregate report here anymore: Configure's
+        // own program-order position (step 16) is no longer the last
+        // self-test hook to actually fire, now that Send (step 17)
+        // runs after it. See on_endpoint_send_syscall below.
+    }
+}
+
+static ENDPOINT_SEND_STEP: AtomicU64 = AtomicU64::new(0);
+static ENDPOINT_SEND_ALL_OK: AtomicBool = AtomicBool::new(true);
+
+/// One row per syscall in the fixed one-step Send sequence appended
+/// to the ring-3 program above, run immediately after Configure.
+const ENDPOINT_SEND_SYSCALL_STEPS: [(&str, ExpectedOutcome); 1] = [(
+    "send slot16 label=0x1234 data0=0xdead data1=0xbeef",
+    ExpectedOutcome::Success,
+)];
+
+/// Called from idt.rs's rose_exception_handler for every `int 0x80`
+/// carrying the Endpoint Send syscall number. Verifies the single
+/// step against ENDPOINT_SEND_SYSCALL_STEPS and, once it lands,
+/// prints the full aggregated verdict across all five syscall
+/// families (CSpace, Retype, Map, Configure, Endpoint Receive/Send)
+/// and halts for good.
+///
+/// This, not on_configure_syscall above, is provably the true final
+/// hook in the whole self-test chain, despite Send (step 17) being
+/// program-order-last in the ring-3 asm and Configure (step 16)
+/// running before it: `endpoint::send`'s own blocking path (see
+/// endpoint.rs) means this function's body only resumes and runs
+/// this log line *after* task0 has been parked, switched away from,
+/// and later woken back up by program2's own Receive call finding it
+/// parked. on_endpoint_receive_syscall's own log line for that
+/// Receive call is therefore guaranteed to already be on the wire by
+/// the time this one fires, even though Send appears later in this
+/// ring-3 program's own text than Configure does. Halting the CPU
+/// here (unlike on_configure_syscall's deliberate non-halt) is safe
+/// again: by this point program2's own liveness and Receive syscalls
+/// have both already fired (see on_syscall's counter and
+/// on_endpoint_receive_syscall below), so there's nothing left for
+/// either task to prove.
+pub fn on_endpoint_send_syscall(arg1: u64, arg2: u64, arg3: u64, arg4: u64, result: u64) {
+    let mut com1 = serial::Serial::init();
+    let step = ENDPOINT_SEND_STEP.fetch_add(1, Ordering::Relaxed);
+
+    let Some(&(label, ref expected)) = ENDPOINT_SEND_SYSCALL_STEPS.get(step as usize) else {
+        let _ = writeln!(
+            com1,
+            "rose: endpoint send syscall self-test: unexpected step {} (num={:#x}), FAILED",
+            step + 1,
+            SYS_ENDPOINT_SEND
+        );
+        ENDPOINT_SEND_ALL_OK.store(false, Ordering::Relaxed);
+        return;
+    };
+
+    let ok = match *expected {
+        ExpectedOutcome::Success => (result as i64) >= 0,
+        ExpectedOutcome::Error(code) => result == code,
+    };
+    if !ok {
+        ENDPOINT_SEND_ALL_OK.store(false, Ordering::Relaxed);
+    }
+
+    let _ = writeln!(
+        com1,
+        "rose: endpoint send syscall self-test: step {} {} (args={:#x},{:#x},{:#x},{:#x}) result={:#x} {}",
+        step + 1,
+        label,
+        arg1,
+        arg2,
+        arg3,
+        arg4,
+        result,
+        if ok { "ok" } else { "FAILED" }
+    );
+
+    if step + 1 >= ENDPOINT_SEND_SYSCALL_STEPS.len() as u64 {
+        let cspace_ok = CSPACE_SYSCALL_ALL_OK.load(Ordering::Relaxed);
+        let untyped_ok = UNTYPED_SYSCALL_ALL_OK.load(Ordering::Relaxed);
+        let map_ok = MAP_SYSCALL_ALL_OK.load(Ordering::Relaxed);
+        let configure_ok = CONFIGURE_SYSCALL_ALL_OK.load(Ordering::Relaxed);
+        let endpoint_receive_ok = ENDPOINT_RECEIVE_ALL_OK.load(Ordering::Relaxed);
+        let endpoint_send_ok = ENDPOINT_SEND_ALL_OK.load(Ordering::Relaxed);
+        let _ = writeln!(
+            com1,
+            "rose: endpoint send syscall self-test: sequence complete, overall {}",
+            if endpoint_send_ok { "confirmed" } else { "FAILED" }
+        );
         let _ = writeln!(
             com1,
             "rose: usermode self-test: full boot sequence {}",
-            if cspace_ok && untyped_ok && map_ok && configure_ok {
+            if cspace_ok
+                && untyped_ok
+                && map_ok
+                && configure_ok
+                && endpoint_receive_ok
+                && endpoint_send_ok
+            {
                 "confirmed"
             } else {
                 "FAILED"
             }
         );
     }
+}
+
+static ENDPOINT_RECEIVE_STEP: AtomicU64 = AtomicU64::new(0);
+static ENDPOINT_RECEIVE_ALL_OK: AtomicBool = AtomicBool::new(true);
+
+/// One row per syscall in the fixed one-step Receive sequence
+/// appended to program2's ring-3 asm above, run immediately after
+/// its liveness syscall.
+const ENDPOINT_RECEIVE_SYSCALL_STEPS: [(&str, ExpectedOutcome); 1] =
+    [("receive slot1", ExpectedOutcome::Success)];
+
+/// Called from idt.rs's rose_exception_handler for every `int 0x80`
+/// carrying the Endpoint Receive syscall number. Verifies the single
+/// step against ENDPOINT_RECEIVE_SYSCALL_STEPS. No aggregate report
+/// or halt here: this always fires chronologically before
+/// on_endpoint_send_syscall's own log line above (task0's Send call
+/// only actually returns, and only logs, after this Receive call has
+/// found it parked and woken it back up), so the true final report
+/// belongs there, not here. See that function's own doc comment.
+pub fn on_endpoint_receive_syscall(
+    arg1: u64,
+    result: u64,
+    label_out: u64,
+    data0: u64,
+    data1: u64,
+) {
+    let mut com1 = serial::Serial::init();
+    let step = ENDPOINT_RECEIVE_STEP.fetch_add(1, Ordering::Relaxed);
+
+    let Some(&(label, ref expected)) = ENDPOINT_RECEIVE_SYSCALL_STEPS.get(step as usize) else {
+        let _ = writeln!(
+            com1,
+            "rose: endpoint receive syscall self-test: unexpected step {} (num={:#x}), FAILED",
+            step + 1,
+            SYS_ENDPOINT_RECEIVE
+        );
+        ENDPOINT_RECEIVE_ALL_OK.store(false, Ordering::Relaxed);
+        return;
+    };
+
+    let ok = match *expected {
+        ExpectedOutcome::Success => (result as i64) >= 0,
+        ExpectedOutcome::Error(code) => result == code,
+    };
+    if !ok {
+        ENDPOINT_RECEIVE_ALL_OK.store(false, Ordering::Relaxed);
+    }
+
+    let _ = writeln!(
+        com1,
+        "rose: endpoint receive syscall self-test: step {} {} (arg1={:#x}) result={:#x} label={:#x} data0={:#x} data1={:#x} {}",
+        step + 1,
+        label,
+        arg1,
+        result,
+        label_out,
+        data0,
+        data1,
+        if ok { "ok" } else { "FAILED" }
+    );
 }
 
 /// Drops from ring 0 to ring 3 via iretq and never returns: there is no

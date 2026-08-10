@@ -74,6 +74,13 @@ struct Task {
     // building a fresh one, and a Box is what lets that already-boxed
     // object move straight in without an extra copy.
     cspace: Box<CSpace>,
+    // Set by `block_current_and_switch` (endpoint.rs's Send/Receive,
+    // v0.1 increment 1), cleared by `wake`. A blocked task is skipped
+    // by `next_runnable_index` on every future tick()/yield_now()/
+    // block_current_and_switch() selection, until something wakes it
+    // back up. Always false for every task before this feature; no
+    // existing caller ever sets it.
+    blocked: bool,
 }
 
 struct Scheduler {
@@ -89,6 +96,29 @@ static SCHEDULER: SpinLock<Scheduler> = SpinLock::new(Scheduler {
 });
 
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Scans forward from `from` (exclusive) for the first task that
+/// isn't `blocked`, wrapping around `tasks` at most once. Falls back
+/// to `from` itself if nothing else qualifies (every other task
+/// blocked, or `tasks.len() == 1`): a documented v0.1 gap, same
+/// spirit as this scheduler's other known cuts (no priority, no
+/// starvation handling). Every task spawned by `spawn`/`spawn_in`
+/// (the self-test's own task_a/task_b/task_c/task_d loops) never
+/// blocks; they only ever yield, so `block_current_and_switch` always
+/// has at least one such candidate to find as long as any of those
+/// still exist in the run queue. Replaces the old bare `(from + 1) %
+/// len` used by `tick()`/`yield_now()` before this feature, which had
+/// no notion of a task being ineligible to run.
+fn next_runnable_index(tasks: &[Task], from: usize) -> usize {
+    let len = tasks.len();
+    for offset in 1..=len {
+        let candidate = (from + offset) % len;
+        if !tasks[candidate].blocked {
+            return candidate;
+        }
+    }
+    from
+}
 
 /// Reads the caller's current RFLAGS, clears IF, and returns the
 /// pre-cli flags so `restore_flags` can put things back exactly as
@@ -142,6 +172,7 @@ pub unsafe fn init() {
         address_space: paging::kernel_address_space(),
         kernel_stack_top: 0,
         cspace: Box::new(CSpace::new()),
+        blocked: false,
     });
     scheduler.current = 0;
     scheduler.ticks_left = TIMESLICE_TICKS;
@@ -226,6 +257,7 @@ pub fn spawn_in(entry: fn(), address_space: AddressSpace) -> usize {
             address_space,
             kernel_stack_top: stack_top,
             cspace: Box::new(CSpace::new()),
+            blocked: false,
         });
         scheduler.tasks.len() - 1
     };
@@ -293,6 +325,7 @@ pub fn spawn_user(
             address_space,
             kernel_stack_top: stack_top,
             cspace,
+            blocked: false,
         });
         scheduler.tasks.len() - 1
     };
@@ -415,7 +448,7 @@ pub fn tick() {
         scheduler.ticks_left = TIMESLICE_TICKS;
 
         let old_index = scheduler.current;
-        let next_index = (old_index + 1) % scheduler.tasks.len();
+        let next_index = next_runnable_index(&scheduler.tasks, old_index);
         scheduler.current = next_index;
 
         if old_index == next_index {
@@ -479,7 +512,7 @@ pub fn yield_now() {
     let (old_rsp_ptr, new_rsp, next_as, next_kernel_stack) = {
         let mut scheduler = SCHEDULER.lock();
         let old_index = scheduler.current;
-        let next_index = (old_index + 1) % scheduler.tasks.len();
+        let next_index = next_runnable_index(&scheduler.tasks, old_index);
         scheduler.current = next_index;
         scheduler.ticks_left = TIMESLICE_TICKS;
 
@@ -514,6 +547,96 @@ pub fn yield_now() {
 
 pub fn switches() -> u64 {
     SWITCHES.load(Ordering::Relaxed)
+}
+
+/// Returns whichever task index is current at the moment of the call.
+/// Same save_flags_and_cli/restore_flags bracket as
+/// `with_current_cspace`, for the identical reason: endpoint.rs's
+/// `send`/`receive` call this from inside the vector-0x80 interrupt
+/// gate (IF=0) as well as, in principle, any future ring-0 caller at
+/// IF=1, so a blind cli/sti pair isn't safe here either.
+pub fn current_index() -> usize {
+    let flags = unsafe { save_flags_and_cli() };
+    let result = {
+        let scheduler = SCHEDULER.lock();
+        scheduler.current
+    };
+    unsafe { restore_flags(flags) };
+    result
+}
+
+/// Voluntarily blocks the calling task and switches to whatever
+/// `next_runnable_index` finds next, if anything. Only caller today
+/// is endpoint.rs's `send`/`receive`, both reached through the
+/// vector-0x80 syscall interrupt gate (idt.rs), which clears IF for
+/// its whole handler; `save_flags_and_cli`/`restore_flags` is required
+/// here for the same reason `with_current_cspace`/`spawn_user` need
+/// it (see their own doc comments), not a blind cli/sti pair.
+///
+/// If no other task is currently runnable (`next_runnable_index`
+/// falls back to the caller's own index), this un-blocks the caller
+/// immediately and returns without ever touching `context_switch`: a
+/// task blocking with nothing else in the run queue to hand the CPU
+/// to would otherwise "switch" to itself and never resume, since
+/// `context_switch`'s own save/restore dance assumes it's always
+/// switching away from the caller, not into a stack frame the caller
+/// itself is still sitting on.
+pub fn block_current_and_switch() {
+    let flags = unsafe { save_flags_and_cli() };
+
+    let (old_rsp_ptr, new_rsp, next_as, next_kernel_stack) = {
+        let mut scheduler = SCHEDULER.lock();
+        let old_index = scheduler.current;
+        scheduler.tasks[old_index].blocked = true;
+        let next_index = next_runnable_index(&scheduler.tasks, old_index);
+
+        if next_index == old_index {
+            // Nothing else runnable; can't actually block. Undo the
+            // blocked flag immediately rather than leaving this task
+            // marked blocked forever with nothing that would ever
+            // call wake() on it.
+            scheduler.tasks[old_index].blocked = false;
+            unsafe { restore_flags(flags) };
+            return;
+        }
+
+        scheduler.current = next_index;
+        scheduler.ticks_left = TIMESLICE_TICKS;
+
+        let old_rsp_ptr = &mut scheduler.tasks[old_index].saved_rsp as *mut u64;
+        let new_rsp = scheduler.tasks[next_index].saved_rsp;
+        let next_as = scheduler.tasks[next_index].address_space;
+        let next_kernel_stack = scheduler.tasks[next_index].kernel_stack_top;
+        (old_rsp_ptr, new_rsp, next_as, next_kernel_stack)
+    };
+
+    unsafe {
+        next_as.switch();
+        gdt::set_kernel_stack(next_kernel_stack);
+        context_switch(old_rsp_ptr, new_rsp);
+    }
+    SWITCHES.fetch_add(1, Ordering::Relaxed);
+
+    unsafe { restore_flags(flags) };
+}
+
+/// Clears `blocked` on the task at `task_index`, making it eligible
+/// for `next_runnable_index` again. Doesn't force an immediate
+/// switch: whichever task calls this (endpoint.rs's `send`/`receive`,
+/// same interrupt-gate context as `block_current_and_switch`, see its
+/// own doc comment for why `save_flags_and_cli`/`restore_flags` is
+/// required here too) keeps running until its own next natural switch
+/// point; the woken task resumes whenever an ordinary tick/yield_now
+/// round-robin reaches its index.
+pub fn wake(task_index: usize) {
+    let flags = unsafe { save_flags_and_cli() };
+    {
+        let mut scheduler = SCHEDULER.lock();
+        if let Some(task) = scheduler.tasks.get_mut(task_index) {
+            task.blocked = false;
+        }
+    }
+    unsafe { restore_flags(flags) };
 }
 
 /// xv6/swtch-style context switch: saves the callee-saved registers not

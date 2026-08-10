@@ -11,11 +11,14 @@
 //     contiguous-region Untyped is boot handoff's job later, once boot
 //     handoff is real (see docs/TRANSITION.md, Phase 1), not this
 //     feature's.
-//   - Frame, CSpace, AddressSpace, and Thread are retypeable.
-//     PageTable/Endpoint/Notification/Reply/IrqHandler retyping are
-//     each their own future feature, added to `retype`'s match arm
-//     when that object type's turn comes. PageTable specifically is a
-//     deliberate punt, not just "not implemented yet": paging.rs's
+//   - Frame, CSpace, AddressSpace, Thread, and (as of this increment)
+//     Endpoint are retypeable. PageTable/Notification/Reply/
+//     IrqHandler retyping are each their own future feature, added to
+//     `retype`'s match arm when that object type's turn comes.
+//     Endpoint retype itself only mints the object and registers it;
+//     see endpoint.rs for what Send/Receive actually do with it.
+//     PageTable specifically is a deliberate punt, not just "not
+//     implemented yet": paging.rs's
 //     AddressSpace::map_page already manages intermediate page-table
 //     levels internally, invisible to the capability model, and there's
 //     no current need (SMP, page-table sharing) to reason about a
@@ -56,7 +59,8 @@
 //     anything into it here; it's an empty address space until some
 //     future Frame.Map syscall populates it.
 
-use crate::cspace::CSpace;
+use crate::cspace::{CSpace, CSpaceError};
+use crate::endpoint::{self, EndpointObject};
 use crate::mem::{self, SpinLock};
 use crate::paging;
 use abi::ObjectType;
@@ -116,8 +120,8 @@ pub enum UntypedError {
     /// Pool has no frames left at the requested watermark.
     Exhausted,
     /// `object_type` isn't one of the retypeable types listed in this
-    /// module's own doc comment (Frame, CSpace, AddressSpace, Thread
-    /// as of this feature).
+    /// module's own doc comment (Frame, CSpace, AddressSpace, Thread,
+    /// Endpoint as of this feature).
     UnsupportedType,
 }
 
@@ -273,7 +277,11 @@ pub fn take_cspace(cspace_id: u64) -> Option<Box<CSpace>> {
 pub fn retype(untyped_id: u64, object_type: ObjectType) -> Result<u64, UntypedError> {
     if !matches!(
         object_type,
-        ObjectType::Frame | ObjectType::CSpace | ObjectType::AddressSpace | ObjectType::Thread
+        ObjectType::Frame
+            | ObjectType::CSpace
+            | ObjectType::AddressSpace
+            | ObjectType::Thread
+            | ObjectType::Endpoint
     ) {
         return Err(UntypedError::UnsupportedType);
     }
@@ -300,6 +308,36 @@ pub fn retype(untyped_id: u64, object_type: ObjectType) -> Result<u64, UntypedEr
         // always satisfied here.
         ObjectType::AddressSpace => Ok(unsafe { paging::new_address_space() }.raw()),
         ObjectType::Thread => Ok(register_thread(ThreadObject { task_index: None })),
+        ObjectType::Endpoint => Ok(endpoint::register_endpoint(EndpointObject::new())),
         _ => unreachable!("checked above"),
     }
+}
+
+/// Grants `cap` directly into slot `dst` of the CSPACE_OBJECTS entry
+/// at `cspace_id`, bypassing any task's own CSpace lookup entirely.
+/// The only legitimate caller today is usermode.rs's self-test
+/// scaffolding (see `on_untyped_syscall`): a freshly retyped CSpace
+/// object sits in this registry, unclaimed, from the moment its own
+/// Retype syscall returns until some later Configure call takes it
+/// via `take_cspace`; the self-test needs to pre-populate a Receive
+/// cap into it during that exact window, and nothing else reaches an
+/// unclaimed CSpace object any other way (a real task can't yet Move
+/// a cap across CSpaces; cspace.rs has no such syscall in v0.1).
+/// Returns `CSpaceError::SourceEmpty` if `cspace_id` doesn't resolve
+/// to a live entry: not a perfect semantic fit (nothing about a
+/// missing registry entry is really "a source cap that's present but
+/// empty"), but this is a one-off internal helper reusing `CSpace`'s
+/// own small error type rather than inventing a third error enum for
+/// a single caller.
+pub fn grant_into_cspace(
+    cspace_id: u64,
+    dst: abi::CPtr,
+    cap: abi::Capability,
+) -> Result<(), CSpaceError> {
+    let mut objects = CSPACE_OBJECTS.lock();
+    let cspace = objects
+        .get_mut(cspace_id as usize)
+        .and_then(|entry| entry.as_mut())
+        .ok_or(CSpaceError::SourceEmpty)?;
+    cspace.grant_root(dst, cap)
 }
