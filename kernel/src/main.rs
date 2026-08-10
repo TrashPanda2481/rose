@@ -5,6 +5,7 @@
 extern crate alloc;
 
 mod cspace;
+mod endpoint;
 mod gdt;
 mod heap;
 mod idt;
@@ -569,6 +570,22 @@ fn usermode_selftest(com1: &mut serial::Serial) -> ! {
     };
     scheduler::with_current_cspace(|cspace| cspace.grant_root(13, code2_cap))
         .expect("rose: usermode self-test: cspace grant_root (code2 frame) failed");
+
+    // Endpoint IPC increment 1: a dedicated 1-frame Untyped pool at
+    // slot15, separate from slot6's own 4-frame pool so the ring-3
+    // program's Endpoint retype (step 10) doesn't disturb the
+    // Exhausted/UnsupportedType arithmetic slot6's pool is sized for.
+    let endpoint_untyped_object = untyped::UntypedObject::new(1)
+        .expect("rose: usermode self-test: out of memory (endpoint untyped pool)");
+    let endpoint_untyped_id = untyped::register_untyped(endpoint_untyped_object);
+    let endpoint_untyped_cap = Capability {
+        object_ref: KernelObjectId(endpoint_untyped_id),
+        object_type: ObjectType::Untyped,
+        rights: full_rights,
+        badge: 0,
+    };
+    scheduler::with_current_cspace(|cspace| cspace.grant_root(15, endpoint_untyped_cap))
+        .expect("rose: usermode self-test: cspace grant_root (endpoint untyped) failed");
 
     let _ = writeln!(
         com1,

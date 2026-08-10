@@ -248,6 +248,27 @@ extern "C" fn rose_exception_handler(frame: *mut InterruptFrame) {
             let result = syscall::dispatch_frame_map(arg1, arg2, arg3, arg4);
             usermode::on_frame_map_syscall(arg1, arg2, arg3, arg4, result);
             frame.regs.rax = result;
+        } else if syscall::is_endpoint_send_syscall(frame.regs.rax) {
+            let arg1 = frame.regs.rdi;
+            let arg2 = frame.regs.rsi;
+            let arg3 = frame.regs.rdx;
+            let arg4 = frame.regs.r10;
+            let result = syscall::dispatch_endpoint_send(arg1, arg2, arg3, arg4);
+            usermode::on_endpoint_send_syscall(arg1, arg2, arg3, arg4, result);
+            frame.regs.rax = result;
+        } else if syscall::is_endpoint_receive_syscall(frame.regs.rax) {
+            let arg1 = frame.regs.rdi;
+            // First syscall that hands back more than one output
+            // register: dispatch_endpoint_receive's own tuple is
+            // exactly (rax, rsi, rdx, r10) in that order, matching
+            // what a resumed ring-3 Receive caller expects to find
+            // per the ABI comment at the top of syscall.rs.
+            let (result, label, data0, data1) = syscall::dispatch_endpoint_receive(arg1);
+            usermode::on_endpoint_receive_syscall(arg1, result, label, data0, data1);
+            frame.regs.rax = result;
+            frame.regs.rsi = label;
+            frame.regs.rdx = data0;
+            frame.regs.r10 = data1;
         } else {
             usermode::on_syscall(frame.regs.rax);
         }
