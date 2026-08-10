@@ -17,6 +17,7 @@ Track every main → stable merge here. Newest first.
 ```
 Date        Commit      What it proves works
 ----        ------      ---------------------
+2026-08-09  a34219e     Endpoint IPC v0.1 increment 1: Endpoint object, blocking Send/Receive (SYS_ENDPOINT_SEND/SYS_ENDPOINT_RECEIVE). Receive-side delivery confirmed on QEMU BIOS+UEFI; full round-trip (Send blocks, wakes, resumes, aggregate report) confirmed in Oracle VM VirtualBox via real hardware timer preemption, the QEMU/TCG truncation there is the pre-existing IRQ0 sandbox limitation, not a defect.
 2026-08-09  a683694     Security audit fixes: Frame-Map ring-3 privilege escalation, W^X bypass, huge-page walk assert, scheduler lock ordering (deadlock risk), Configure commit-before-verify, Untyped rights check. Verified end to end on QEMU (BIOS+UEFI) and Oracle VM VirtualBox.
 2026-08-08  a7750e9     PCI enumeration v0.1, Frame-Map syscall (fixes Configure page-fault bug), and per-task kernel entry stacks (fixes post-syscall page-fault bug), verified end to end on QEMU (BIOS+UEFI) and Oracle VM VirtualBox.
 2026-08-01  44903de     Retype extended to AddressSpace and Thread (six-step ring-3 self-test), verified end to end on QEMU (BIOS) and Oracle VM VirtualBox.
