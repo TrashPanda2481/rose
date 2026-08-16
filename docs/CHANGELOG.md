@@ -2,6 +2,10 @@
 
 Format: date, what changed, why. Newest first.
 
+## 2026-08-15
+
+- Endpoint IPC increment 2 built: Call and Reply syscalls added on top of increment 1's Send/Receive, so a task can now send a message and block waiting for a specific response instead of just fire-and-forget (full writeup in `docs/cores/kernel/CHANGELOG.md`). A Reply capability is minted per outstanding Call and handed to whichever task receives it, the only way to answer that specific request. Zero build warnings. Booted clean on QEMU BIOS and UEFI: both runs confirm Send, the second Receive, and the Reply syscall itself, then truncate right before Call's own final resume line, the same pre-existing timer-preemption limitation already known from increment 1, one hop further out; not a regression. Not yet run in Oracle VM VirtualBox, so the full round-trip and the new cross-family aggregate report (now living on Call instead of Send) aren't confirmed under real hardware preemption yet.
+
 ## 2026-08-09
 
 - Kernel security audit: 5 parallel independent review passes across the whole `kernel/src/` tree (boot/interrupts, memory/paging, capabilities, scheduler/usermode, syscall dispatch/PCI), weighted toward memory safety, capability/privilege correctness, and interrupt-safety rather than typical logic bugs, on the reasoning that this is unsafe systems code where a bug can mean a privilege boundary crossed, not just a wrong answer. Two passes converged independently on the same root vulnerability from different angles; two others independently found the same rights gap. 5 real bugs found and fixed same day, full writeups in `docs/cores/kernel/BUGS.md`:

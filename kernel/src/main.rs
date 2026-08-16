@@ -13,6 +13,7 @@ mod mem;
 mod paging;
 mod pci;
 mod pic;
+mod reply;
 mod scheduler;
 mod serial;
 mod syscall;

@@ -20,8 +20,9 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::gdt;
 use crate::serial;
 use crate::syscall::{
-    SYS_CSPACE_COPY, SYS_CSPACE_MINT, SYS_CSPACE_MOVE, SYS_CSPACE_REVOKE, SYS_ENDPOINT_RECEIVE,
-    SYS_ENDPOINT_SEND, SYS_FRAME_MAP, SYS_THREAD_CONFIGURE, SYS_UNTYPED_RETYPE,
+    SYS_CSPACE_COPY, SYS_CSPACE_MINT, SYS_CSPACE_MOVE, SYS_CSPACE_REVOKE, SYS_ENDPOINT_CALL,
+    SYS_ENDPOINT_RECEIVE, SYS_ENDPOINT_REPLY, SYS_ENDPOINT_SEND, SYS_FRAME_MAP,
+    SYS_THREAD_CONFIGURE, SYS_UNTYPED_RETYPE,
 };
 use crate::untyped;
 use abi::{Capability, KernelObjectId, ObjectType, Rights};
@@ -119,11 +120,21 @@ use abi::{Capability, KernelObjectId, ObjectType, Rights};
 //       parked yet: this always takes Send's blocking path (see
 //       endpoint.rs's own doc comment), parking task0 here until
 //       program2's own Receive step (below) finds it and wakes it
-//       back up. Because of that, on_endpoint_send_syscall's own hook,
-//       not on_configure_syscall's, despite Configure being the
-//       program-order-last step in this ring-3 program's own text,
-//       is provably the last self-test hook to actually fire; see its
-//       own doc comment for why the aggregate report lives there now.
+//       back up.
+// Extended past the Send step with one Call step, Endpoint IPC
+// increment 2's own final step, cross-checked against
+// on_endpoint_call_syscall's own single-row table below:
+//   18. CALL on slot16 (same Endpoint as step 17), label=0x5678,
+//       data0=0xf00d, data1=0xba5e. Whether this takes call()'s own
+//       fast or slow path for its send phase depends on real timer
+//       preemption against program2's own second Receive step (see
+//       program2's own doc comment below) -- either way, this then
+//       always blocks a second time waiting for program2's matching
+//       Reply. Because of that second, unconditional block,
+//       on_endpoint_call_syscall's own hook, not
+//       on_endpoint_send_syscall's, is now provably the last
+//       self-test hook to actually fire; see its own doc comment for
+//       why the aggregate report moved there.
 core::arch::global_asm!(
     ".section .rodata.user_program, \"a\"",
     ".global user_program_start",
@@ -256,6 +267,17 @@ core::arch::global_asm!(
     "mov r10, 0xbeef",
     "mov rax, 0x1007",
     "int 0x80",
+    // 18: CALL on slot16 (same Endpoint), label=0x5678, data0=0xf00d,
+    // data1=0xba5e. Blocks twice: once for the send phase (fast path
+    // if program2's own second Receive is already parked by the time
+    // this runs, slow path otherwise), then always a second time
+    // waiting specifically for program2's own Reply.
+    "mov rdi, 16",
+    "mov rsi, 0x5678",
+    "mov rdx, 0xf00d",
+    "mov r10, 0xba5e",
+    "mov rax, 0x1009",
+    "int 0x80",
     "2:",
     "jmp 2b",
     "user_program_end:",
@@ -275,7 +297,24 @@ core::arch::global_asm!(
 // This always finds task0 already parked on its own Send (step 17
 // above ran first, before this task was even schedulable), so it
 // takes the immediate delivery-in-place path (see endpoint.rs) and
-// wakes task0 back up rather than blocking itself.
+// wakes task0 back up rather than blocking itself. rsi is set to 0
+// explicitly ahead of this call (added for increment 2, see below):
+// dispatch_endpoint_receive now always reads arg2 (reply_dst_cptr)
+// from rsi, and 0 is the correct "don't care" sentinel for a
+// Send-originated Receive like this one, which carries no reply_id
+// to install a cap for either way.
+//
+// Third job, added for Endpoint IPC increment 2: a second RECEIVE on
+// slot1, this time with reply_dst_cptr=2 (slot2, confirmed free --
+// nothing else in this program uses it) in rsi, followed by a REPLY
+// on slot2. Whichever order this second Receive and task0's own Call
+// (user_program's own step 18, above) actually land in depends on
+// real timer preemption; either order is handled correctly by
+// endpoint::receive's/call's own fast-path/slow-path split (see
+// endpoint.rs). dispatch_endpoint_receive's own side effect installs
+// a Reply cap into this task's own CSpace at slot2 once this second
+// Receive returns successfully, which the following Reply syscall
+// then consumes.
 core::arch::global_asm!(
     ".section .rodata.user_program2, \"a\"",
     ".global user_program2_start",
@@ -284,7 +323,25 @@ core::arch::global_asm!(
     "mov rax, 1",
     "int 0x80",
     "mov rdi, 1",
+    "mov rsi, 0",
     "mov rax, 0x1008",
+    "int 0x80",
+    // Second RECEIVE on slot1, reply_dst_cptr=2 (slot2). Matches
+    // task0's own Call (user_program's step 18).
+    "mov rdi, 1",
+    "mov rsi, 2",
+    "mov rax, 0x1008",
+    "int 0x80",
+    // REPLY on slot2 (the Reply cap the Receive just above installed
+    // into this task's own CSpace), label=0x4321, data0=0xcafe,
+    // data1=0xbabe -- a distinct payload from every other step's own,
+    // so the self-test log can tell this response apart from the
+    // original Call's request.
+    "mov rdi, 2",
+    "mov rsi, 0x4321",
+    "mov rdx, 0xcafe",
+    "mov r10, 0xbabe",
+    "mov rax, 0x100a",
     "int 0x80",
     "2:",
     "jmp 2b",
@@ -766,27 +823,12 @@ const ENDPOINT_SEND_SYSCALL_STEPS: [(&str, ExpectedOutcome); 1] = [(
 
 /// Called from idt.rs's rose_exception_handler for every `int 0x80`
 /// carrying the Endpoint Send syscall number. Verifies the single
-/// step against ENDPOINT_SEND_SYSCALL_STEPS and, once it lands,
-/// prints the full aggregated verdict across all five syscall
-/// families (CSpace, Retype, Map, Configure, Endpoint Receive/Send)
-/// and halts for good.
+/// step against ENDPOINT_SEND_SYSCALL_STEPS.
 ///
-/// This, not on_configure_syscall above, is provably the true final
-/// hook in the whole self-test chain, despite Send (step 17) being
-/// program-order-last in the ring-3 asm and Configure (step 16)
-/// running before it: `endpoint::send`'s own blocking path (see
-/// endpoint.rs) means this function's body only resumes and runs
-/// this log line *after* task0 has been parked, switched away from,
-/// and later woken back up by program2's own Receive call finding it
-/// parked. on_endpoint_receive_syscall's own log line for that
-/// Receive call is therefore guaranteed to already be on the wire by
-/// the time this one fires, even though Send appears later in this
-/// ring-3 program's own text than Configure does. Halting the CPU
-/// here (unlike on_configure_syscall's deliberate non-halt) is safe
-/// again: by this point program2's own liveness and Receive syscalls
-/// have both already fired (see on_syscall's counter and
-/// on_endpoint_receive_syscall below), so there's nothing left for
-/// either task to prove.
+/// No cross-family aggregate report or halt here anymore: Send (step
+/// 17) is no longer the last self-test hook to actually fire, now
+/// that Call (step 18, appended for Endpoint IPC increment 2) runs
+/// after it. See on_endpoint_call_syscall below.
 pub fn on_endpoint_send_syscall(arg1: u64, arg2: u64, arg3: u64, arg4: u64, result: u64) {
     let mut com1 = serial::Serial::init();
     let step = ENDPOINT_SEND_STEP.fetch_add(1, Ordering::Relaxed);
@@ -824,54 +866,47 @@ pub fn on_endpoint_send_syscall(arg1: u64, arg2: u64, arg3: u64, arg4: u64, resu
     );
 
     if step + 1 >= ENDPOINT_SEND_SYSCALL_STEPS.len() as u64 {
-        let cspace_ok = CSPACE_SYSCALL_ALL_OK.load(Ordering::Relaxed);
-        let untyped_ok = UNTYPED_SYSCALL_ALL_OK.load(Ordering::Relaxed);
-        let map_ok = MAP_SYSCALL_ALL_OK.load(Ordering::Relaxed);
-        let configure_ok = CONFIGURE_SYSCALL_ALL_OK.load(Ordering::Relaxed);
-        let endpoint_receive_ok = ENDPOINT_RECEIVE_ALL_OK.load(Ordering::Relaxed);
         let endpoint_send_ok = ENDPOINT_SEND_ALL_OK.load(Ordering::Relaxed);
         let _ = writeln!(
             com1,
             "rose: endpoint send syscall self-test: sequence complete, overall {}",
             if endpoint_send_ok { "confirmed" } else { "FAILED" }
         );
-        let _ = writeln!(
-            com1,
-            "rose: usermode self-test: full boot sequence {}",
-            if cspace_ok
-                && untyped_ok
-                && map_ok
-                && configure_ok
-                && endpoint_receive_ok
-                && endpoint_send_ok
-            {
-                "confirmed"
-            } else {
-                "FAILED"
-            }
-        );
+        // No cross-family aggregate report here anymore: Send's own
+        // program-order position (step 17) is no longer the last
+        // self-test hook to actually fire, now that Call (step 18)
+        // runs after it. See on_endpoint_call_syscall below.
     }
 }
 
 static ENDPOINT_RECEIVE_STEP: AtomicU64 = AtomicU64::new(0);
 static ENDPOINT_RECEIVE_ALL_OK: AtomicBool = AtomicBool::new(true);
 
-/// One row per syscall in the fixed one-step Receive sequence
-/// appended to program2's ring-3 asm above, run immediately after
-/// its liveness syscall.
-const ENDPOINT_RECEIVE_SYSCALL_STEPS: [(&str, ExpectedOutcome); 1] =
-    [("receive slot1", ExpectedOutcome::Success)];
+/// One row per syscall in the now two-step Receive sequence appended
+/// to program2's ring-3 asm above. Row 0 is the original
+/// increment-1 Receive (immediately after program2's own liveness
+/// syscall, matching task0's Send); row 1 is increment 2's own
+/// second Receive (reply_dst_cptr=2), matching task0's own Call.
+const ENDPOINT_RECEIVE_SYSCALL_STEPS: [(&str, ExpectedOutcome); 2] = [
+    ("receive slot1", ExpectedOutcome::Success),
+    ("receive slot1 reply_dst=2", ExpectedOutcome::Success),
+];
 
 /// Called from idt.rs's rose_exception_handler for every `int 0x80`
-/// carrying the Endpoint Receive syscall number. Verifies the single
-/// step against ENDPOINT_RECEIVE_SYSCALL_STEPS. No aggregate report
-/// or halt here: this always fires chronologically before
-/// on_endpoint_send_syscall's own log line above (task0's Send call
-/// only actually returns, and only logs, after this Receive call has
-/// found it parked and woken it back up), so the true final report
-/// belongs there, not here. See that function's own doc comment.
+/// carrying the Endpoint Receive syscall number. Verifies the
+/// current step against ENDPOINT_RECEIVE_SYSCALL_STEPS. No aggregate
+/// report or halt here: this always fires chronologically before
+/// on_endpoint_call_syscall's own log line below, both for row 0
+/// (task0's Send call only actually returns, and only logs, after
+/// this Receive call has found it parked and woken it back up) and
+/// for row 1 (task0's Call only actually returns, and only logs,
+/// after the matching Reply -- itself only reachable once this
+/// second Receive has returned and handed program2 the Reply cap at
+/// slot2), so the true final report belongs there, not here. See
+/// that function's own doc comment.
 pub fn on_endpoint_receive_syscall(
     arg1: u64,
+    arg2: u64,
     result: u64,
     label_out: u64,
     data0: u64,
@@ -901,16 +936,187 @@ pub fn on_endpoint_receive_syscall(
 
     let _ = writeln!(
         com1,
-        "rose: endpoint receive syscall self-test: step {} {} (arg1={:#x}) result={:#x} label={:#x} data0={:#x} data1={:#x} {}",
+        "rose: endpoint receive syscall self-test: step {} {} (arg1={:#x},arg2={:#x}) result={:#x} label={:#x} data0={:#x} data1={:#x} {}",
         step + 1,
         label,
         arg1,
+        arg2,
         result,
         label_out,
         data0,
         data1,
         if ok { "ok" } else { "FAILED" }
     );
+}
+
+static ENDPOINT_CALL_STEP: AtomicU64 = AtomicU64::new(0);
+static ENDPOINT_CALL_ALL_OK: AtomicBool = AtomicBool::new(true);
+
+/// One row per syscall in the fixed one-step Call sequence appended
+/// to the ring-3 program above, run immediately after Send (step
+/// 18, Endpoint IPC increment 2).
+const ENDPOINT_CALL_SYSCALL_STEPS: [(&str, ExpectedOutcome); 1] = [(
+    "call slot16 label=0x5678 data0=0xf00d data1=0xba5e",
+    ExpectedOutcome::Success,
+)];
+
+static ENDPOINT_REPLY_STEP: AtomicU64 = AtomicU64::new(0);
+static ENDPOINT_REPLY_ALL_OK: AtomicBool = AtomicBool::new(true);
+
+/// One row per syscall in the fixed one-step Reply sequence appended
+/// to program2's ring-3 asm above, run immediately after its second
+/// Receive (Endpoint IPC increment 2).
+const ENDPOINT_REPLY_SYSCALL_STEPS: [(&str, ExpectedOutcome); 1] = [(
+    "reply slot2 label=0x4321 data0=0xcafe data1=0xbabe",
+    ExpectedOutcome::Success,
+)];
+
+/// Called from idt.rs's rose_exception_handler for every `int 0x80`
+/// carrying the Endpoint Reply syscall number. Verifies the single
+/// step against ENDPOINT_REPLY_SYSCALL_STEPS. No aggregate report or
+/// halt here: this always fires chronologically before
+/// on_endpoint_call_syscall's own log line below -- `reply::reply`
+/// (see reply.rs) wakes task0's own blocked Call *after* this
+/// function's own hook has already returned control to program2,
+/// but task0 cannot actually resume and log its own Call result
+/// until the scheduler switches back to it, which cannot happen
+/// before this Reply syscall itself has returned -- so the true
+/// final report belongs there, not here. See that function's own
+/// doc comment.
+pub fn on_endpoint_reply_syscall(arg1: u64, arg2: u64, arg3: u64, arg4: u64, result: u64) {
+    let mut com1 = serial::Serial::init();
+    let step = ENDPOINT_REPLY_STEP.fetch_add(1, Ordering::Relaxed);
+
+    let Some(&(label, ref expected)) = ENDPOINT_REPLY_SYSCALL_STEPS.get(step as usize) else {
+        let _ = writeln!(
+            com1,
+            "rose: endpoint reply syscall self-test: unexpected step {} (num={:#x}), FAILED",
+            step + 1,
+            SYS_ENDPOINT_REPLY
+        );
+        ENDPOINT_REPLY_ALL_OK.store(false, Ordering::Relaxed);
+        return;
+    };
+
+    let ok = match *expected {
+        ExpectedOutcome::Success => (result as i64) >= 0,
+        ExpectedOutcome::Error(code) => result == code,
+    };
+    if !ok {
+        ENDPOINT_REPLY_ALL_OK.store(false, Ordering::Relaxed);
+    }
+
+    let _ = writeln!(
+        com1,
+        "rose: endpoint reply syscall self-test: step {} {} (args={:#x},{:#x},{:#x},{:#x}) result={:#x} {}",
+        step + 1,
+        label,
+        arg1,
+        arg2,
+        arg3,
+        arg4,
+        result,
+        if ok { "ok" } else { "FAILED" }
+    );
+}
+
+/// Called from idt.rs's rose_exception_handler for every `int 0x80`
+/// carrying the Endpoint Call syscall number. Verifies the single
+/// step against ENDPOINT_CALL_SYSCALL_STEPS and, once it lands,
+/// prints the full aggregated verdict across all seven syscall
+/// families (CSpace, Retype, Map, Configure, Endpoint
+/// Receive/Send/Call/Reply) and halts for good.
+///
+/// This, not on_endpoint_send_syscall above, is provably the true
+/// final hook in the whole self-test chain: `endpoint::call`'s own
+/// second, unconditional block (see endpoint.rs) means this
+/// function's body only resumes and runs this log line *after*
+/// task0 has been parked a second time, switched away from, and
+/// later woken back up by program2's own Reply call. on_endpoint_
+/// reply_syscall's own log line for that Reply call is therefore
+/// guaranteed to already be on the wire by the time this one fires,
+/// exactly mirroring how Send previously superseded Configure's own
+/// claim to this role.
+pub fn on_endpoint_call_syscall(
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+    result: u64,
+    label_out: u64,
+    data0: u64,
+    data1: u64,
+) {
+    let mut com1 = serial::Serial::init();
+    let step = ENDPOINT_CALL_STEP.fetch_add(1, Ordering::Relaxed);
+
+    let Some(&(label, ref expected)) = ENDPOINT_CALL_SYSCALL_STEPS.get(step as usize) else {
+        let _ = writeln!(
+            com1,
+            "rose: endpoint call syscall self-test: unexpected step {} (num={:#x}), FAILED",
+            step + 1,
+            SYS_ENDPOINT_CALL
+        );
+        ENDPOINT_CALL_ALL_OK.store(false, Ordering::Relaxed);
+        return;
+    };
+
+    let ok = match *expected {
+        ExpectedOutcome::Success => (result as i64) >= 0,
+        ExpectedOutcome::Error(code) => result == code,
+    };
+    if !ok {
+        ENDPOINT_CALL_ALL_OK.store(false, Ordering::Relaxed);
+    }
+
+    let _ = writeln!(
+        com1,
+        "rose: endpoint call syscall self-test: step {} {} (args={:#x},{:#x},{:#x},{:#x}) result={:#x} label={:#x} data0={:#x} data1={:#x} {}",
+        step + 1,
+        label,
+        arg1,
+        arg2,
+        arg3,
+        arg4,
+        result,
+        label_out,
+        data0,
+        data1,
+        if ok { "ok" } else { "FAILED" }
+    );
+
+    if step + 1 >= ENDPOINT_CALL_SYSCALL_STEPS.len() as u64 {
+        let cspace_ok = CSPACE_SYSCALL_ALL_OK.load(Ordering::Relaxed);
+        let untyped_ok = UNTYPED_SYSCALL_ALL_OK.load(Ordering::Relaxed);
+        let map_ok = MAP_SYSCALL_ALL_OK.load(Ordering::Relaxed);
+        let configure_ok = CONFIGURE_SYSCALL_ALL_OK.load(Ordering::Relaxed);
+        let endpoint_receive_ok = ENDPOINT_RECEIVE_ALL_OK.load(Ordering::Relaxed);
+        let endpoint_send_ok = ENDPOINT_SEND_ALL_OK.load(Ordering::Relaxed);
+        let endpoint_call_ok = ENDPOINT_CALL_ALL_OK.load(Ordering::Relaxed);
+        let endpoint_reply_ok = ENDPOINT_REPLY_ALL_OK.load(Ordering::Relaxed);
+        let _ = writeln!(
+            com1,
+            "rose: endpoint call syscall self-test: sequence complete, overall {}",
+            if endpoint_call_ok { "confirmed" } else { "FAILED" }
+        );
+        let _ = writeln!(
+            com1,
+            "rose: usermode self-test: full boot sequence {}",
+            if cspace_ok
+                && untyped_ok
+                && map_ok
+                && configure_ok
+                && endpoint_receive_ok
+                && endpoint_send_ok
+                && endpoint_call_ok
+                && endpoint_reply_ok
+            {
+                "confirmed"
+            } else {
+                "FAILED"
+            }
+        );
+    }
 }
 
 /// Drops from ring 0 to ring 3 via iretq and never returns: there is no
