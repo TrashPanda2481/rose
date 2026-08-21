@@ -331,25 +331,55 @@ impl CSpace {
         Ok(())
     }
 
+    // Iterative, not recursive: revoke used to recurse once per tree
+    // level, so teardown depth rode on the kernel stack. Bounded today
+    // (one CSpace, CSPACE_SLOTS deep at most), but a long derivation
+    // chain, or one spanning CSpaces once IPC/Move can carry caps
+    // between them, would eventually be able to overflow it. An explicit
+    // work stack moves that depth onto the heap, where it's bounded by
+    // available memory rather than by a fixed kernel stack. This does
+    // not make revoke preemptible or bound its total work; a large tree
+    // is still a long non-preemptible operation (a real interrupt-
+    // latency concern, tracked separately), it just can no longer take
+    // out the stack on the way.
     fn revoke_subtree(&mut self, target: CPtr) -> Result<(), CSpaceError> {
+        // Unlink the root of the subtree from its surviving parent before
+        // tearing anything down, so no stale CPtr lingers in an ancestor
+        // that outlives this revoke. Every other node in the subtree has
+        // its parent inside the subtree, so those links vanish along with
+        // the parent slots themselves and need no separate unlink; the
+        // recursive version unlinked each node individually, which was
+        // correct but redundant for everything below the root.
         let index = Self::check_slot(target)?;
-        let children = match self.slots[index].as_ref() {
-            Some(slot) => slot.children.clone(),
-            None => return Ok(()), // already gone, nothing to do
-        };
-        for child in children {
-            self.revoke_subtree(child)?;
-        }
-        // Unlink from the parent's child list before clearing, so a
-        // stale CPtr can't linger in a surviving ancestor.
-        let parent = self.slots[index].as_ref().and_then(|s| s.parent);
-        if let Some(parent) = parent {
+        let root_parent = self.slots[index].as_ref().and_then(|s| s.parent);
+        if let Some(parent) = root_parent {
             let parent_index = Self::check_slot(parent)?;
             if let Some(parent_slot) = self.slots[parent_index].as_mut() {
                 parent_slot.children.retain(|c| *c != target);
             }
         }
-        self.slots[index] = None;
+
+        // Clear the root and every descendant. Order within the subtree
+        // doesn't affect the result: all of them end up empty, and the
+        // one externally-visible link (root -> surviving parent) is
+        // already gone above. `take()` empties a slot and hands back its
+        // children to enqueue; a slot that comes back `None` (a slot
+        // already cleared, which a well-formed single-parent tree never
+        // reaches twice) is simply skipped, so a node is idempotent to
+        // process.
+        let mut work: alloc::vec::Vec<CPtr> = alloc::vec::Vec::new();
+        work.push(target);
+        while let Some(cptr) = work.pop() {
+            let node_index = match Self::check_slot(cptr) {
+                Ok(node_index) => node_index,
+                Err(_) => continue,
+            };
+            if let Some(slot) = self.slots[node_index].take() {
+                for child in slot.children {
+                    work.push(child);
+                }
+            }
+        }
         Ok(())
     }
 }
