@@ -158,6 +158,8 @@ unsafe extern "C" fn kernel_main() -> ! {
 
     cspace_selftest(&mut com1);
 
+    cspace_deep_revoke_selftest(&mut com1);
+
     pci_selftest(&mut com1);
 
     usermode_selftest(&mut com1)
@@ -846,6 +848,70 @@ fn cspace_selftest(com1: &mut serial::Serial) {
         if move_cleared_src { "ok" } else { "FAILED" },
         if refs_match { "match" } else { "MISMATCH" },
         if mint_narrowed { "ok" } else { "FAILED" },
+        if all_cleared { "ok" } else { "FAILED" },
+        if ok { "confirmed" } else { "FAILED" }
+    );
+}
+
+/// Revokes a maximally deep derivation chain, the case cspace.rs's
+/// iterative `revoke` exists to survive. Builds a single linear chain
+/// (slot 1 root, each later slot copied as a child of the one before it)
+/// until the next slot number runs past the CSpace's capacity, so it
+/// fills to the maximum depth without naming CSPACE_SLOTS, then revokes
+/// the root and checks every slot in the chain emptied. Depth is bounded
+/// by CSpace size today, but this is the shape that would have overflowed
+/// the old recursive revoke once a chain can span CSpaces via IPC/Move;
+/// proving the full-depth cascade clears is the regression guard for
+/// that. The plain cspace_selftest above only builds a depth-2 tree,
+/// which every version of revoke handles, so it can't stand in for this.
+fn cspace_deep_revoke_selftest(com1: &mut serial::Serial) {
+    let mut cspace = cspace::CSpace::new();
+    let kernel_as = paging::kernel_address_space();
+    let full_rights = Rights::READ.union(Rights::WRITE).union(Rights::MAP);
+    let root_cap = Capability {
+        object_ref: KernelObjectId(kernel_as.raw()),
+        object_type: ObjectType::AddressSpace,
+        rights: full_rights,
+        badge: 0,
+    };
+
+    cspace
+        .grant_root(1, root_cap)
+        .expect("rose: cspace deep-revoke self-test: grant_root failed");
+
+    // Extend one chain by copying each slot as a child of the one before,
+    // stopping when the next slot number is out of range (copy returns
+    // InvalidSlot for a dst past the CSpace's capacity). `depth` ends at
+    // the number of slots in the chain, root included.
+    let mut depth: u32 = 1;
+    loop {
+        let next = depth + 1;
+        if cspace.copy(depth, next, full_rights).is_err() {
+            break;
+        }
+        depth = next;
+    }
+
+    // The chain has to be genuinely deep for this to prove anything: a
+    // shallow one passes the old recursive revoke too. Floor guards
+    // against a future shrink of CSPACE_SLOTS silently gutting the test.
+    let deep_enough = depth >= 32;
+    let tail_present = cspace.lookup(depth).is_some();
+
+    cspace
+        .revoke(1)
+        .expect("rose: cspace deep-revoke self-test: revoke failed");
+
+    // Every slot the chain occupied, 1..=depth, must be empty now.
+    let all_cleared = (1..=depth).all(|cptr| cspace.lookup(cptr).is_none());
+
+    let ok = deep_enough && tail_present && all_cleared;
+    let _ = writeln!(
+        com1,
+        "rose: cspace deep-revoke self-test: chain depth {}, deep enough {}, tail present pre-revoke {}, whole chain cleared {}, overall {}",
+        depth,
+        if deep_enough { "ok" } else { "FAILED" },
+        if tail_present { "ok" } else { "FAILED" },
         if all_cleared { "ok" } else { "FAILED" },
         if ok { "confirmed" } else { "FAILED" }
     );
