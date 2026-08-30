@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+mod console;
 mod cspace;
 mod endpoint;
 mod gdt;
@@ -13,6 +14,7 @@ mod mem;
 mod paging;
 mod pci;
 mod pic;
+mod reply;
 mod scheduler;
 mod serial;
 mod syscall;
@@ -32,6 +34,7 @@ use limine::RequestsEndMarker;
 use limine::RequestsStartMarker;
 use limine::memmap;
 use limine::request::ExecutableAddressRequest;
+use limine::request::FramebufferRequest;
 use limine::request::HhdmRequest;
 use limine::request::MemmapRequest;
 
@@ -46,6 +49,10 @@ static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
 #[used]
 #[unsafe(link_section = ".requests")]
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+
+#[used]
+#[unsafe(link_section = ".requests")]
+static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 
 #[used]
 #[unsafe(link_section = ".requests")]
@@ -115,6 +122,23 @@ unsafe extern "C" fn kernel_main() -> ! {
     unsafe {
         paging::init(hhdm_offset, entries);
     }
+
+    // Framebuffer is only safe to draw into from here on: paging::init()
+    // just carried its HHDM mapping forward (see paging.rs). Everything
+    // printed above this point (boot ok, memmap dump, hhdm offset, the
+    // frame-allocator and IDT self-tests) is necessarily serial-only.
+    // `com1` upgrades in place, so every writeln! call site below this
+    // stays exactly as written; only the type changes.
+    if let Some(fb) = FRAMEBUFFER_REQUEST
+        .response()
+        .and_then(|r| r.framebuffers().first().copied())
+    {
+        unsafe {
+            console::init(fb);
+        }
+    }
+    let mut com1 = console::Dual::upgrade(com1);
+
     let _ = writeln!(com1, "rose: page tables loaded, kernel-owned");
 
     paging_selftest(&mut com1);
@@ -157,6 +181,8 @@ unsafe extern "C" fn kernel_main() -> ! {
 
     cspace_selftest(&mut com1);
 
+    cspace_deep_revoke_selftest(&mut com1);
+
     pci_selftest(&mut com1);
 
     usermode_selftest(&mut com1)
@@ -179,7 +205,7 @@ fn idt_selftest(com1: &mut serial::Serial) {
 /// the frame goes back to the allocator cleanly. Proves map_page/unmap_page
 /// work on the kernel's own tables, not just that the CR3 switch succeeded
 /// without immediately faulting.
-fn paging_selftest(com1: &mut serial::Serial) {
+fn paging_selftest(com1: &mut console::Dual) {
     const TEST_VIRT: u64 = 0xffff_a000_0000_0000;
     const PATTERN: u64 = 0xdead_beef_cafe_f00d;
 
@@ -223,7 +249,7 @@ fn paging_selftest(com1: &mut serial::Serial) {
 /// entirely in ring 0 so it's safe either direction. No explicit
 /// initial switch back to the kernel address space is needed going in,
 /// since `paging::init()` already put it there at boot.
-fn address_space_selftest(com1: &mut serial::Serial) {
+fn address_space_selftest(com1: &mut console::Dual) {
     // Distinct from usermode.rs's 0x400000/0x600000 on purpose, though a
     // collision would be harmless anyway: different PML4 roots mean the
     // same virtual address in two AddressSpaces maps to two entirely
@@ -285,7 +311,7 @@ fn address_space_selftest(com1: &mut serial::Serial) {
 /// GlobalAlloc's default `realloc`). Everything goes out of scope at the
 /// end of this function, so the free-byte count logged after should match
 /// the one logged right after heap::init().
-fn heap_selftest(com1: &mut serial::Serial) {
+fn heap_selftest(com1: &mut console::Dual) {
     let boxed = Box::new(0xdead_beef_u64);
     let _ = writeln!(com1, "rose: heap self-test: boxed value = {:#x}", *boxed);
 
@@ -345,7 +371,7 @@ fn rdtsc() -> u64 {
 /// working hardware timer (confirmed via a VirtualBox boot where the
 /// tick counter visibly advanced) still got reported as "no hardware
 /// irq0" because the test gave up too early. See BUGS.md.
-fn timer_selftest(com1: &mut serial::Serial) {
+fn timer_selftest(com1: &mut console::Dual) {
     const MAX_ASSUMED_HZ: u64 = 8_000_000_000;
     const WAIT_SECONDS: u64 = 2;
     let cycle_budget = MAX_ASSUMED_HZ * WAIT_SECONDS;
@@ -414,7 +440,7 @@ static mut KERNEL_SCRATCH_STACK: [u8; KERNEL_SCRATCH_STACK_SIZE] = [0; KERNEL_SC
 /// docs. This is why it's the last thing kernel_main calls, and why the
 /// old trailing `loop { hlt }` that used to sit here is gone, it would
 /// have been unreachable code once this diverges instead.
-fn usermode_selftest(com1: &mut serial::Serial) -> ! {
+fn usermode_selftest(com1: &mut console::Dual) -> ! {
     // Both arbitrary, page-aligned, and far below the kernel's
     // higher-half virtual range and the HHDM range alike, guaranteeing
     // a fresh PML4 branch (see paging.rs's next_level PAGE_USER fix;
@@ -651,7 +677,7 @@ fn task_b() {
 /// special-casing needed. This is the portable proof point; hardware
 /// preemption itself is only visible opportunistically via switches()
 /// counting higher than the 20 voluntary yields below would alone.
-fn scheduler_selftest(com1: &mut serial::Serial) {
+fn scheduler_selftest(com1: &mut console::Dual) {
     // scheduler::init() already ran earlier in kernel_main, before
     // interrupts were enabled; calling it again here would double-push
     // task 0.
@@ -735,7 +761,7 @@ fn task_d() {
 /// forever like task_a/task_b do, so the mappings need to stay valid
 /// for the rest of boot anyway. Same no-teardown scope cut as
 /// everywhere else address spaces show up so far.
-fn scheduled_address_space_selftest(com1: &mut serial::Serial) {
+fn scheduled_address_space_selftest(com1: &mut console::Dual) {
     let as_a = unsafe { paging::new_address_space() };
     let as_b = unsafe { paging::new_address_space() };
 
@@ -790,7 +816,7 @@ fn scheduled_address_space_selftest(com1: &mut serial::Serial) {
 /// emptied out. No syscall involved; this calls cspace::CSpace's
 /// methods directly, see the module doc in cspace.rs for what's still
 /// missing before that's possible.
-fn cspace_selftest(com1: &mut serial::Serial) {
+fn cspace_selftest(com1: &mut console::Dual) {
     let mut cspace = cspace::CSpace::new();
     let kernel_as = paging::kernel_address_space();
     let full_rights = Rights::READ.union(Rights::WRITE).union(Rights::MAP);
@@ -850,12 +876,76 @@ fn cspace_selftest(com1: &mut serial::Serial) {
     );
 }
 
+/// Revokes a maximally deep derivation chain, the case cspace.rs's
+/// iterative `revoke` exists to survive. Builds a single linear chain
+/// (slot 1 root, each later slot copied as a child of the one before it)
+/// until the next slot number runs past the CSpace's capacity, so it
+/// fills to the maximum depth without naming CSPACE_SLOTS, then revokes
+/// the root and checks every slot in the chain emptied. Depth is bounded
+/// by CSpace size today, but this is the shape that would have overflowed
+/// the old recursive revoke once a chain can span CSpaces via IPC/Move;
+/// proving the full-depth cascade clears is the regression guard for
+/// that. The plain cspace_selftest above only builds a depth-2 tree,
+/// which every version of revoke handles, so it can't stand in for this.
+fn cspace_deep_revoke_selftest(com1: &mut console::Dual) {
+    let mut cspace = cspace::CSpace::new();
+    let kernel_as = paging::kernel_address_space();
+    let full_rights = Rights::READ.union(Rights::WRITE).union(Rights::MAP);
+    let root_cap = Capability {
+        object_ref: KernelObjectId(kernel_as.raw()),
+        object_type: ObjectType::AddressSpace,
+        rights: full_rights,
+        badge: 0,
+    };
+
+    cspace
+        .grant_root(1, root_cap)
+        .expect("rose: cspace deep-revoke self-test: grant_root failed");
+
+    // Extend one chain by copying each slot as a child of the one before,
+    // stopping when the next slot number is out of range (copy returns
+    // InvalidSlot for a dst past the CSpace's capacity). `depth` ends at
+    // the number of slots in the chain, root included.
+    let mut depth: u32 = 1;
+    loop {
+        let next = depth + 1;
+        if cspace.copy(depth, next, full_rights).is_err() {
+            break;
+        }
+        depth = next;
+    }
+
+    // The chain has to be genuinely deep for this to prove anything: a
+    // shallow one passes the old recursive revoke too. Floor guards
+    // against a future shrink of CSPACE_SLOTS silently gutting the test.
+    let deep_enough = depth >= 32;
+    let tail_present = cspace.lookup(depth).is_some();
+
+    cspace
+        .revoke(1)
+        .expect("rose: cspace deep-revoke self-test: revoke failed");
+
+    // Every slot the chain occupied, 1..=depth, must be empty now.
+    let all_cleared = (1..=depth).all(|cptr| cspace.lookup(cptr).is_none());
+
+    let ok = deep_enough && tail_present && all_cleared;
+    let _ = writeln!(
+        com1,
+        "rose: cspace deep-revoke self-test: chain depth {}, deep enough {}, tail present pre-revoke {}, whole chain cleared {}, overall {}",
+        depth,
+        if deep_enough { "ok" } else { "FAILED" },
+        if tail_present { "ok" } else { "FAILED" },
+        if all_cleared { "ok" } else { "FAILED" },
+        if ok { "confirmed" } else { "FAILED" }
+    );
+}
+
 /// Walks the PCI bus via the legacy config mechanism and logs every
 /// function that reports a real vendor id. No expected device list to
 /// check against, the point is discovery itself; QEMU's own standard
 /// virtual devices (host bridge, ISA bridge, etc.) show up here as
 /// ordinary log lines like anything else found.
-fn pci_selftest(com1: &mut serial::Serial) {
+fn pci_selftest(com1: &mut console::Dual) {
     let _ = writeln!(com1, "rose: pci self-test: enumerating");
     let mut count: u32 = 0;
     pci::enumerate(|dev| {

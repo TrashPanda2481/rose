@@ -46,6 +46,3 @@ Two branches: `main` (active work, can be broken) and `stable` (only known-good 
 
 QEMU for automated smoke tests, Oracle VM VirtualBox as a second-opinion check before stable promotion. See `docs/TESTING.md`.
 
-## Repo visibility
-
-Private. Not published anywhere public.

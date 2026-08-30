@@ -16,6 +16,7 @@ use crate::cspace::{CSpace, CSpaceError};
 use crate::endpoint::{self, EndpointError, Message};
 use crate::mem;
 use crate::paging;
+use crate::reply;
 use crate::scheduler;
 use crate::thread::{self, ConfigureError};
 use crate::untyped::{self, UntypedError};
@@ -31,6 +32,8 @@ pub const SYS_THREAD_CONFIGURE: u64 = 0x1005;
 pub const SYS_FRAME_MAP: u64 = 0x1006;
 pub const SYS_ENDPOINT_SEND: u64 = 0x1007;
 pub const SYS_ENDPOINT_RECEIVE: u64 = 0x1008;
+pub const SYS_ENDPOINT_CALL: u64 = 0x1009;
+pub const SYS_ENDPOINT_REPLY: u64 = 0x100A;
 
 /// Frame-Map's own flags argument: a small, clean bitfield instead of
 /// raw hardware PTE bits. paging.rs's PAGE_* constants are an
@@ -95,6 +98,24 @@ pub fn is_endpoint_send_syscall(num: u64) -> bool {
 /// which shape of call to make.
 pub fn is_endpoint_receive_syscall(num: u64) -> bool {
     num == SYS_ENDPOINT_RECEIVE
+}
+
+/// True if `num` is the Endpoint-Call syscall. Own predicate/dispatch
+/// pair, same reasoning as `is_endpoint_receive_syscall` above: Call
+/// hands back a 4-tuple (rax plus the eventual Reply's own response
+/// payload in rsi/rdx/r10), the same output shape as Receive, so
+/// idt.rs's dispatch chain needs its own syscall-number check to
+/// route to it.
+pub fn is_endpoint_call_syscall(num: u64) -> bool {
+    num == SYS_ENDPOINT_CALL
+}
+
+/// True if `num` is the Endpoint-Reply syscall. Own predicate/dispatch
+/// pair: Reply's own error space (ReplyError, see reply.rs) is a
+/// fourth, unrelated enum, distinct from EndpointError despite both
+/// living in this same increment.
+pub fn is_endpoint_reply_syscall(num: u64) -> bool {
+    num == SYS_ENDPOINT_REPLY
 }
 
 /// Maps a CSpace op's Result onto the single-register return
@@ -579,8 +600,23 @@ pub fn dispatch_endpoint_send(arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64
 /// Same two-phase reasoning as `dispatch_endpoint_send` above: the cap
 /// lookup happens inside `with_current_cspace`; `endpoint::receive`
 /// (which may block) runs only after that closure returns.
-pub fn dispatch_endpoint_receive(arg1: u64) -> (u64, u64, u64, u64) {
+/// arg2=reply_dst_cptr: 0 is the "don't care" sentinel every existing
+/// Send-originated Receive caller uses (no Reply cap gets installed
+/// in that case, regardless of whether the underlying message even
+/// carried a reply_id -- it never does, for plain Send). A nonzero
+/// value only actually installs anything if the delivered message
+/// really did come from `call()` (`reply_id.is_some()`); a nonzero
+/// reply_dst_cptr against a Send-originated message is simply a
+/// no-op, not an error, since there's nothing to install either way.
+///
+/// The install itself is best-effort: message delivery has already
+/// succeeded by the time this runs, so a rejected `grant_root` (e.g.
+/// the caller picked an already-occupied slot) is swallowed rather
+/// than turning an otherwise-successful Receive into a failure over a
+/// follow-on bookkeeping step.
+pub fn dispatch_endpoint_receive(arg1: u64, arg2: u64) -> (u64, u64, u64, u64) {
     let endpoint_cptr = arg1 as u32;
+    let reply_dst_cptr = arg2 as u32;
 
     let looked_up = scheduler::with_current_cspace(|cspace| {
         cspace
@@ -596,7 +632,114 @@ pub fn dispatch_endpoint_receive(arg1: u64) -> (u64, u64, u64, u64) {
     };
 
     match endpoint::receive(endpoint_id) {
-        Ok(message) => (0, message.label as u64, message.data0, message.data1),
+        Ok((message, reply_id)) => {
+            if reply_dst_cptr != 0 {
+                if let Some(reply_id) = reply_id {
+                    let reply_cap = Capability {
+                        object_ref: KernelObjectId(reply_id),
+                        object_type: ObjectType::Reply,
+                        rights: Rights::SEND,
+                        badge: 0,
+                    };
+                    let _ = scheduler::with_current_cspace(|cspace| {
+                        cspace.grant_root(reply_dst_cptr, reply_cap)
+                    });
+                }
+            }
+            (0, message.label as u64, message.data0, message.data1)
+        }
         Err(e) => (encode_endpoint_error(e), 0, 0, 0),
+    }
+}
+
+/// Maps a ReplyError onto the single-register return convention. +50
+/// offset: the next free band after CSpaceError's bare 1-4,
+/// UntypedError's +10 (11-13), ConfigureError's +20 (21-24), MapError's
+/// +30 (31-35), and EndpointError's +40, same non-colliding-band
+/// convention as every earlier `encode_*` function's own comment.
+fn encode_reply_error(e: reply::ReplyError) -> u64 {
+    (-(e.code() as i64 + 50)) as u64
+}
+
+/// Runs Endpoint-Call against the calling task's own CSpace. Argument
+/// meaning: arg1=endpoint cptr, arg2=label, arg3=data0, arg4=data1.
+/// Returns (rax, rsi, rdx, r10) exactly like
+/// `dispatch_endpoint_receive`: rax=0/error, rsi/rdx/r10 carry the
+/// eventual Reply's own response payload on success (0s on failure,
+/// not meaningful).
+///
+/// Same cap check as `dispatch_endpoint_send` (Endpoint + SEND, not
+/// RECEIVE): Call's own send phase is exactly `send`'s own fast-path/
+/// slow-path split (see `endpoint::call`), so the calling side only
+/// ever needs SEND on the endpoint cptr itself -- RECEIVE only comes
+/// into it via the one-shot Reply cap `dispatch_endpoint_receive`
+/// hands the other side, which is a separate object entirely.
+pub fn dispatch_endpoint_call(arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> (u64, u64, u64, u64) {
+    let endpoint_cptr = arg1 as u32;
+    let label = arg2 as u32;
+    let data0 = arg3;
+    let data1 = arg4;
+
+    let looked_up = scheduler::with_current_cspace(|cspace| {
+        cspace
+            .lookup(endpoint_cptr)
+            .filter(|cap| {
+                cap.object_type == ObjectType::Endpoint && cap.rights.contains(Rights::SEND)
+            })
+            .map(|cap| cap.object_ref.0)
+    });
+
+    let Some(endpoint_id) = looked_up else {
+        return (encode_endpoint_error(EndpointError::InvalidEndpoint), 0, 0, 0);
+    };
+
+    let message = Message {
+        label,
+        data0,
+        data1,
+    };
+    match endpoint::call(endpoint_id, message) {
+        Ok(response) => (0, response.label as u64, response.data0, response.data1),
+        Err(e) => (encode_endpoint_error(e), 0, 0, 0),
+    }
+}
+
+/// Runs Reply against the calling task's own CSpace. Argument
+/// meaning: arg1=reply cptr, arg2=label, arg3=data0, arg4=data1.
+/// Returns 0 on success (rax only; Reply never hands back a value
+/// beyond success/failure, mirroring Send), negative ReplyError on
+/// failure.
+///
+/// Unlike every syscall above, the object this looks up is a Reply
+/// cap -- minted directly by `dispatch_endpoint_receive`'s own side
+/// effect, never by Retype (see reply.rs's module doc) -- checked for
+/// `Rights::SEND` the same way an Endpoint-Send cptr is: replying is
+/// conceptually "sending" the response back down the one-shot channel
+/// Receive handed out.
+pub fn dispatch_endpoint_reply(arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
+    let reply_cptr = arg1 as u32;
+    let label = arg2 as u32;
+    let data0 = arg3;
+    let data1 = arg4;
+
+    let looked_up = scheduler::with_current_cspace(|cspace| {
+        cspace
+            .lookup(reply_cptr)
+            .filter(|cap| cap.object_type == ObjectType::Reply && cap.rights.contains(Rights::SEND))
+            .map(|cap| cap.object_ref.0)
+    });
+
+    let Some(reply_id) = looked_up else {
+        return encode_reply_error(reply::ReplyError::InvalidReply);
+    };
+
+    let message = Message {
+        label,
+        data0,
+        data1,
+    };
+    match reply::reply(reply_id, message) {
+        Ok(()) => 0,
+        Err(e) => encode_reply_error(e),
     }
 }

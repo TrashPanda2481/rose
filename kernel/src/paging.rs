@@ -18,11 +18,16 @@
 //      instant CR3 changes. First attempt at this left it out and the
 //      very next stack access after the CR3 write (a spilled local in
 //      switch_to, before this function even returns) double-faulted;
-//      see BUGS.md. Framebuffer, ACPI, and reserved regions stay out for
-//      now, nothing dereferences them through HHDM yet. Same offset value
-//      Limine gave us is reused, so `phys + hhdm_offset` keeps meaning
-//      the same thing across the CR3 switch; nothing in mem.rs needs to
-//      change.
+//      see BUGS.md. MEMMAP_FRAMEBUFFER is included too, as of the
+//      framebuffer console (console.rs): Limine's own tables HHDM-map
+//      it (base revision 3+ includes Framebuffer in that list per the
+//      Limine protocol), so once this build() replaces those tables the
+//      mapping has to be carried forward or every pixel write through
+//      the HHDM-derived address console.rs uses would fault. ACPI and
+//      reserved regions still stay out, nothing dereferences them
+//      through HHDM yet. Same offset value Limine gave us is reused, so
+//      `phys + hhdm_offset` keeps meaning the same thing across the CR3
+//      switch; nothing in mem.rs or console.rs needs to change.
 //
 // AddressSpace is the primitive multiple page-table roots are built on:
 // the kernel's own, plus one per usermode component (see usermode.rs) or
@@ -369,6 +374,7 @@ unsafe fn build(hhdm_offset: u64, memmap_entries: &[&memmap::Entry]) -> AddressS
     for entry in memmap_entries {
         if entry.type_ != memmap::MEMMAP_USABLE
             && entry.type_ != memmap::MEMMAP_BOOTLOADER_RECLAIMABLE
+            && entry.type_ != memmap::MEMMAP_FRAMEBUFFER
         {
             continue;
         }

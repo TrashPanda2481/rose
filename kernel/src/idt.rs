@@ -258,17 +258,51 @@ extern "C" fn rose_exception_handler(frame: *mut InterruptFrame) {
             frame.regs.rax = result;
         } else if syscall::is_endpoint_receive_syscall(frame.regs.rax) {
             let arg1 = frame.regs.rdi;
+            // arg2 (rsi) = reply_dst_cptr, added for Call/Reply
+            // (increment 2): 0 is every existing Send-originated
+            // caller's own "don't care" sentinel, see
+            // dispatch_endpoint_receive's own doc. Read before the
+            // dispatch call, same as arg1, even though this same
+            // register (rsi) is also part of the *output* shape
+            // written back below -- the local `arg2` binding here
+            // captures the input value before it gets overwritten.
+            let arg2 = frame.regs.rsi;
             // First syscall that hands back more than one output
             // register: dispatch_endpoint_receive's own tuple is
             // exactly (rax, rsi, rdx, r10) in that order, matching
             // what a resumed ring-3 Receive caller expects to find
             // per the ABI comment at the top of syscall.rs.
-            let (result, label, data0, data1) = syscall::dispatch_endpoint_receive(arg1);
-            usermode::on_endpoint_receive_syscall(arg1, result, label, data0, data1);
+            let (result, label, data0, data1) = syscall::dispatch_endpoint_receive(arg1, arg2);
+            usermode::on_endpoint_receive_syscall(arg1, arg2, result, label, data0, data1);
             frame.regs.rax = result;
             frame.regs.rsi = label;
             frame.regs.rdx = data0;
             frame.regs.r10 = data1;
+        } else if syscall::is_endpoint_call_syscall(frame.regs.rax) {
+            let arg1 = frame.regs.rdi;
+            let arg2 = frame.regs.rsi;
+            let arg3 = frame.regs.rdx;
+            let arg4 = frame.regs.r10;
+            // Same (rax, rsi, rdx, r10) output shape as Receive just
+            // above: Call's own success payload is the eventual
+            // Reply's response, not just a bare 0/error like Send.
+            let (result, label, data0, data1) =
+                syscall::dispatch_endpoint_call(arg1, arg2, arg3, arg4);
+            usermode::on_endpoint_call_syscall(arg1, arg2, arg3, arg4, result, label, data0, data1);
+            frame.regs.rax = result;
+            frame.regs.rsi = label;
+            frame.regs.rdx = data0;
+            frame.regs.r10 = data1;
+        } else if syscall::is_endpoint_reply_syscall(frame.regs.rax) {
+            let arg1 = frame.regs.rdi;
+            let arg2 = frame.regs.rsi;
+            let arg3 = frame.regs.rdx;
+            let arg4 = frame.regs.r10;
+            // Single output register only, same shape as Send: Reply
+            // never hands back a value beyond success/failure.
+            let result = syscall::dispatch_endpoint_reply(arg1, arg2, arg3, arg4);
+            usermode::on_endpoint_reply_syscall(arg1, arg2, arg3, arg4, result);
+            frame.regs.rax = result;
         } else {
             usermode::on_syscall(frame.regs.rax);
         }

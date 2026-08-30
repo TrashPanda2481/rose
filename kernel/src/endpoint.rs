@@ -1,8 +1,10 @@
-// Endpoint IPC, v0.1 increment 1.
+// Endpoint IPC, v0.1 increment 2 (adds Call; Reply itself lives in
+// reply.rs).
 //
-// Register-only, blocking Send/Receive only; no Call yet, no shared
-// buffer, no cap transfer. See docs/cores/kernel/README.md, "IPC":
-// this implements a subset of that spec (label plus two data words,
+// Register-only Send/Receive/Call; no shared buffer, no cap transfer
+// beyond the single Reply cap Receive can hand back (see reply.rs's
+// own module doc). See docs/cores/kernel/README.md, "IPC": this
+// implements a subset of that spec (label plus two data words,
 // instead of the full length/cap_count/data[]/caps[] struct there);
 // the smaller shape is what a self-test can exercise end to end right
 // now, not a change to the eventual spec, see this feature's own
@@ -20,10 +22,8 @@
 //   - Send always blocks if no receiver is already waiting: v0.1 has
 //     no queue depth, no async Send, matching the README's "Send:
 //     blocks if no receiver waiting / no queue space" for the
-//     zero-queue-space case specifically.
-//   - No Call (Send + implicit Receive on a Reply cap). Two separate
-//     verbs only; Call is layered on top of these once Reply objects
-//     exist.
+//     zero-queue-space case specifically. Call's own send phase
+//     (below) reuses this exact same fast-path/slow-path split.
 //   - No badge on the receiving side yet. The README says "badge
 //     tells you which minted cap the sender used"; this increment's
 //     Message has no badge field, since nothing here mints Endpoint
@@ -33,6 +33,7 @@
 //     flat round-robin, no priority to order by yet).
 
 use crate::mem::SpinLock;
+use crate::reply::{self, ReplyObject};
 use crate::scheduler;
 use alloc::vec::Vec;
 
@@ -50,9 +51,14 @@ pub struct Message {
 /// of) directly, in place, without a separate mailbox. `message`
 /// starts `Some` for a parked sender (its own outgoing message) and
 /// `None` for a parked receiver (until some later Send fills it in).
+/// `reply_id` is `None` for a plain Send/Receive Waiter and `Some` for
+/// one that originated from `call()`; whichever Receive claims this
+/// Waiter is what turns a `Some` here into an actual Reply capability
+/// (see syscall.rs's `dispatch_endpoint_receive`).
 struct Waiter {
     task_index: usize,
     message: Option<Message>,
+    reply_id: Option<u64>,
 }
 
 /// One sync IPC rendezvous point. `senders`/`receivers` are FIFO
@@ -151,6 +157,7 @@ pub fn send(endpoint_id: u64, message: Message) -> Result<(), EndpointError> {
     endpoint.senders.push(Waiter {
         task_index,
         message: Some(message),
+        reply_id: None,
     });
     drop(objects);
     scheduler::block_current_and_switch();
@@ -163,12 +170,15 @@ pub fn send(endpoint_id: u64, message: Message) -> Result<(), EndpointError> {
     Ok(())
 }
 
-/// Receives one message from the endpoint at `endpoint_id`.
-/// Non-blocking fast path if a sender is already parked: removes it
-/// from the senders queue outright and returns its message, waking
-/// the sender. Otherwise parks the caller as a new receiver Waiter
-/// and blocks until some future Send delivers into it.
-pub fn receive(endpoint_id: u64) -> Result<Message, EndpointError> {
+/// Receives one message from the endpoint at `endpoint_id`. Returns
+/// the message alongside the reply_id of whichever Call sent it, if
+/// it came from `call()` rather than plain `send()` (`None` in that
+/// latter case, since there's nothing to reply to). Non-blocking fast
+/// path if a sender is already parked: removes it from the senders
+/// queue outright and returns its message, waking the sender.
+/// Otherwise parks the caller as a new receiver Waiter and blocks
+/// until some future Send or Call delivers into it.
+pub fn receive(endpoint_id: u64) -> Result<(Message, Option<u64>), EndpointError> {
     let task_index = scheduler::current_index();
 
     {
@@ -183,15 +193,17 @@ pub fn receive(endpoint_id: u64) -> Result<Message, EndpointError> {
             let message = sender
                 .message
                 .expect("rose: endpoint: parked sender had no message");
+            let reply_id = sender.reply_id;
             let sender_task = sender.task_index;
             drop(objects);
             scheduler::wake(sender_task);
-            return Ok(message);
+            return Ok((message, reply_id));
         }
 
         endpoint.receivers.push(Waiter {
             task_index,
             message: None,
+            reply_id: None,
         });
         // Lock dropped here (end of block), before blocking: holding
         // it across block_current_and_switch would leave it locked
@@ -203,15 +215,16 @@ pub fn receive(endpoint_id: u64) -> Result<Message, EndpointError> {
 
     scheduler::block_current_and_switch();
 
-    // Resumed here once some future Send has found this task's own
-    // Waiter in the receivers queue (by task_index, see send()'s
-    // fast path above) and filled in its message. Re-lock and pull
-    // the now-filled entry back out by identity rather than trusting
-    // anything computed before this task blocked: the Vec's own
-    // indices can have shifted underneath while this was parked (any
-    // number of unrelated remove(0) calls against this same queue
-    // could have run in the meantime), so `task_index` -- this task's
-    // own stable identity -- is the only thing safe to search by.
+    // Resumed here once some future Send or Call has found this
+    // task's own Waiter in the receivers queue (by task_index, see
+    // send()'s fast path above) and filled in its message (and,
+    // for Call, its reply_id). Re-lock and pull the now-filled entry
+    // back out by identity rather than trusting anything computed
+    // before this task blocked: the Vec's own indices can have
+    // shifted underneath while this was parked (any number of
+    // unrelated remove(0) calls against this same queue could have
+    // run in the meantime), so `task_index` -- this task's own
+    // stable identity -- is the only thing safe to search by.
     let mut objects = ENDPOINT_OBJECTS.lock();
     let endpoint = objects
         .get_mut(endpoint_id as usize)
@@ -226,5 +239,85 @@ pub fn receive(endpoint_id: u64) -> Result<Message, EndpointError> {
     let message = waiter
         .message
         .expect("rose: endpoint: own receiver waiter woke with no message");
-    Ok(message)
+    Ok((message, waiter.reply_id))
+}
+
+/// Sends `message` to the endpoint at `endpoint_id` and blocks until
+/// the eventual matching Reply delivers a response, returning it.
+/// Layered directly on top of `send`'s own fast-path/slow-path split
+/// for the send phase (steps 3-4 below), plus a second, always-taken
+/// block for the reply phase (step 5) that has no equivalent in plain
+/// `send`.
+///
+/// Order of operations, and why:
+///   1. Capture this task's own identity first, same reasoning as
+///      `send`'s own doc comment (never hold this lock and
+///      SCHEDULER's at once).
+///   2. Validate the endpoint exists *before* minting a Reply object.
+///      An InvalidEndpoint error has to leave no trace: minting the
+///      reply.rs entry first and only then discovering the endpoint
+///      doesn't exist would orphan that entry for good, since nothing
+///      would ever reply to it or take_reply it back out.
+///   3/4. Deliver the send phase exactly like `send` does: fast path
+///      if a receiver is already parked (deliver in place, wake it,
+///      do NOT block for this phase), slow path otherwise (park as a
+///      sender Waiter, block once, resume once some Receive claims
+///      it). Either way, by the time step 5 below runs, the message
+///      has either already been handed to a receiver or is sitting in
+///      the senders queue ready to be claimed.
+///   5. Block a second time, unconditionally, waiting specifically
+///      for `reply::reply` to wake this exact task. This is the one
+///      new block plain `send` never takes; whether step 3/4 took the
+///      fast path (zero blocks so far) or the slow path (one block so
+///      far), this call always blocks exactly once more here, for
+///      exactly one total block in the fast case and two total blocks
+///      in the slow case.
+pub fn call(endpoint_id: u64, message: Message) -> Result<Message, EndpointError> {
+    let task_index = scheduler::current_index();
+
+    let mut objects = ENDPOINT_OBJECTS.lock();
+    let endpoint = objects
+        .get_mut(endpoint_id as usize)
+        .and_then(|entry| entry.as_mut())
+        .ok_or(EndpointError::InvalidEndpoint)?;
+
+    // Endpoint confirmed live; only now is it safe to mint the Reply
+    // object nothing has claimed yet (see step 2 above).
+    let reply_id = reply::register_reply(ReplyObject {
+        task_index,
+        message: None,
+    });
+
+    if let Some(receiver) = endpoint.receivers.first_mut() {
+        receiver.message = Some(message);
+        receiver.reply_id = Some(reply_id);
+        let receiver_task = receiver.task_index;
+        drop(objects);
+        scheduler::wake(receiver_task);
+        // Fast path taken: no block yet for the send phase, matching
+        // send()'s own fast path exactly. Falls through to the
+        // always-taken reply-phase block below.
+    } else {
+        endpoint.senders.push(Waiter {
+            task_index,
+            message: Some(message),
+            reply_id: Some(reply_id),
+        });
+        drop(objects);
+        scheduler::block_current_and_switch();
+        // Resumed here once some future Receive has taken this
+        // Waiter out of the senders queue, exactly like send()'s own
+        // slow path. Falls through to the always-taken reply-phase
+        // block below -- this is the second block for this call, not
+        // a repeat of the first.
+    }
+
+    // Reply phase: block unconditionally, regardless of which branch
+    // above ran, waiting for reply::reply(reply_id, ...) to wake this
+    // task specifically (see reply.rs).
+    scheduler::block_current_and_switch();
+
+    let response = reply::take_reply(reply_id)
+        .expect("rose: endpoint: call resumed with no reply message");
+    Ok(response)
 }
