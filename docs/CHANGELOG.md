@@ -2,6 +2,10 @@
 
 Format: date, what changed, why. Newest first.
 
+## 2026-08-30
+
+- Framebuffer console added: kernel boot output now mirrors onto the screen live, not just serial, so the machine's progress is visible without a serial capture (full writeup in `docs/cores/kernel/CHANGELOG.md`). White-on-black 8x8 monospace text, starts mirroring right after page tables load (kernel_main's earliest boot-ok/memmap/hhdm/frame-allocator/IDT lines stay serial-only by necessity, before the framebuffer mapping exists). Zero build warnings. QEMU BIOS boot confirmed both by serial log (unchanged content and ordering versus before this feature) and by a screendump capture showing the same self-test output rendered on screen, scrolling correctly. Not yet run in Oracle VM VirtualBox; not promoted to `stable`.
+
 ## 2026-08-15
 
 - Endpoint IPC increment 2 built: Call and Reply syscalls added on top of increment 1's Send/Receive, so a task can now send a message and block waiting for a specific response instead of just fire-and-forget (full writeup in `docs/cores/kernel/CHANGELOG.md`). A Reply capability is minted per outstanding Call and handed to whichever task receives it, the only way to answer that specific request. Zero build warnings. Booted clean on QEMU BIOS and UEFI: both runs confirm Send, the second Receive, and the Reply syscall itself, then truncate right before Call's own final resume line, the same pre-existing timer-preemption limitation already known from increment 1, one hop further out; not a regression. Not yet run in Oracle VM VirtualBox, so the full round-trip and the new cross-family aggregate report (now living on Call instead of Send) aren't confirmed under real hardware preemption yet.

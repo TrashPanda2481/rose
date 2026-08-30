@@ -17,8 +17,8 @@
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::console;
 use crate::gdt;
-use crate::serial;
 use crate::syscall::{
     SYS_CSPACE_COPY, SYS_CSPACE_MINT, SYS_CSPACE_MOVE, SYS_CSPACE_REVOKE, SYS_ENDPOINT_CALL,
     SYS_ENDPOINT_RECEIVE, SYS_ENDPOINT_REPLY, SYS_ENDPOINT_SEND, SYS_FRAME_MAP,
@@ -393,7 +393,7 @@ static SYSCALL_COUNT: AtomicU64 = AtomicU64::new(0);
 /// runs after these two in the same ring-3 program and needs to be
 /// the thing that actually stops the CPU for good. See module docs.
 pub fn on_syscall(rax: u64) {
-    let mut com1 = serial::Serial::init();
+    let mut com1 = console::Dual::init();
     let count = SYSCALL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     let _ = writeln!(
         com1,
@@ -436,7 +436,7 @@ const CSPACE_SYSCALL_STEPS: [(&str, u64, u64); 6] = [
 /// fires first, same as the legacy on_syscall halt used to be reached
 /// before this feature.
 pub fn on_cspace_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, result: u64) {
-    let mut com1 = serial::Serial::init();
+    let mut com1 = console::Dual::init();
     let step = CSPACE_SYSCALL_STEP.fetch_add(1, Ordering::Relaxed);
 
     let Some(&(label, expected_num, expected_result)) =
@@ -559,7 +559,7 @@ const UNTYPED_SYSCALL_STEPS: [(&str, ExpectedOutcome); 7] = [
 /// after the existing ok/FAILED check below so a failed retype never
 /// feeds a bogus id or object into the grant.
 pub fn on_untyped_syscall(arg1: u64, arg2: u64, arg3: u64, result: u64) {
-    let mut com1 = serial::Serial::init();
+    let mut com1 = console::Dual::init();
     let step = UNTYPED_SYSCALL_STEP.fetch_add(1, Ordering::Relaxed);
 
     let Some(&(label, ref expected)) = UNTYPED_SYSCALL_STEPS.get(step as usize) else {
@@ -679,7 +679,7 @@ const MAP_SYSCALL_STEPS: [(&str, ExpectedOutcome); 2] = [
 /// slot9's AddressSpace has real mappings at CODE2_VADDR/STACK2_VADDR,
 /// not just user_as.
 pub fn on_frame_map_syscall(arg1: u64, arg2: u64, arg3: u64, arg4: u64, result: u64) {
-    let mut com1 = serial::Serial::init();
+    let mut com1 = console::Dual::init();
     let step = MAP_SYSCALL_STEP.fetch_add(1, Ordering::Relaxed);
 
     let Some(&(label, ref expected)) = MAP_SYSCALL_STEPS.get(step as usize) else {
@@ -761,7 +761,7 @@ const CONFIGURE_SYSCALL_STEPS: [(&str, ExpectedOutcome); 1] = [(
 /// tools/smoke-test.sh) is the honest tradeoff for this cut; a real
 /// exit/shutdown path is a future feature's job, not this one's.
 pub fn on_configure_syscall(arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, result: u64) {
-    let mut com1 = serial::Serial::init();
+    let mut com1 = console::Dual::init();
     let step = CONFIGURE_SYSCALL_STEP.fetch_add(1, Ordering::Relaxed);
 
     let Some(&(label, ref expected)) = CONFIGURE_SYSCALL_STEPS.get(step as usize) else {
@@ -830,7 +830,7 @@ const ENDPOINT_SEND_SYSCALL_STEPS: [(&str, ExpectedOutcome); 1] = [(
 /// that Call (step 18, appended for Endpoint IPC increment 2) runs
 /// after it. See on_endpoint_call_syscall below.
 pub fn on_endpoint_send_syscall(arg1: u64, arg2: u64, arg3: u64, arg4: u64, result: u64) {
-    let mut com1 = serial::Serial::init();
+    let mut com1 = console::Dual::init();
     let step = ENDPOINT_SEND_STEP.fetch_add(1, Ordering::Relaxed);
 
     let Some(&(label, ref expected)) = ENDPOINT_SEND_SYSCALL_STEPS.get(step as usize) else {
@@ -912,7 +912,7 @@ pub fn on_endpoint_receive_syscall(
     data0: u64,
     data1: u64,
 ) {
-    let mut com1 = serial::Serial::init();
+    let mut com1 = console::Dual::init();
     let step = ENDPOINT_RECEIVE_STEP.fetch_add(1, Ordering::Relaxed);
 
     let Some(&(label, ref expected)) = ENDPOINT_RECEIVE_SYSCALL_STEPS.get(step as usize) else {
@@ -984,7 +984,7 @@ const ENDPOINT_REPLY_SYSCALL_STEPS: [(&str, ExpectedOutcome); 1] = [(
 /// final report belongs there, not here. See that function's own
 /// doc comment.
 pub fn on_endpoint_reply_syscall(arg1: u64, arg2: u64, arg3: u64, arg4: u64, result: u64) {
-    let mut com1 = serial::Serial::init();
+    let mut com1 = console::Dual::init();
     let step = ENDPOINT_REPLY_STEP.fetch_add(1, Ordering::Relaxed);
 
     let Some(&(label, ref expected)) = ENDPOINT_REPLY_SYSCALL_STEPS.get(step as usize) else {
@@ -1047,7 +1047,7 @@ pub fn on_endpoint_call_syscall(
     data0: u64,
     data1: u64,
 ) {
-    let mut com1 = serial::Serial::init();
+    let mut com1 = console::Dual::init();
     let step = ENDPOINT_CALL_STEP.fetch_add(1, Ordering::Relaxed);
 
     let Some(&(label, ref expected)) = ENDPOINT_CALL_SYSCALL_STEPS.get(step as usize) else {
