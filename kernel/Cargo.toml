@@ -11,6 +11,14 @@ path = "src/main.rs"
 limine = "0.6.5"
 abi = { package = "rose-abi", path = "../abi" }
 
+[features]
+# The legacy ring-3 self-test (kernel/src/usermode.rs). Off by default:
+# a normal boot hands off to the root task instead. Kept as an opt-in
+# regression artifact, since it exercises CSpace/Untyped/IPC error paths
+# the root program does not. See
+# docs/cores/kernel/plans/root-task-handoff.md.
+usermode_selftest = []
+
 [profile.dev]
 panic = "abort"
 

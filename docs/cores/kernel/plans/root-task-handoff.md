@@ -1,6 +1,6 @@
 # Root task / boot handoff: increment 1
 
-Status: planned, not started. Branch `wt/root-task`.
+Status: implemented on `wt/root-task` and QEMU-smoke verified (full boot reaches the handoff success line). Pending the Oracle VM VirtualBox gate and merge. See the kernel CHANGELOG entry dated 2026-10-17.
 
 ## Goal
 

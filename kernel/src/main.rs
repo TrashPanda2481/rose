@@ -21,7 +21,10 @@ mod syscall;
 mod thread;
 mod timer;
 mod untyped;
+#[cfg(feature = "usermode_selftest")]
 mod usermode;
+#[cfg(not(feature = "usermode_selftest"))]
+mod root;
 
 use abi::{Capability, KernelObjectId, ObjectType, Rights};
 use alloc::boxed::Box;
@@ -52,7 +55,7 @@ static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 
 #[used]
 #[unsafe(link_section = ".requests")]
-static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
+pub(crate) static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 
 #[used]
 #[unsafe(link_section = ".requests")]
@@ -185,6 +188,24 @@ unsafe extern "C" fn kernel_main() -> ! {
 
     pci_selftest(&mut com1);
 
+    // Phase 1 boot handoff: hand all remaining authority to one
+    // privileged root task, then idle. Under the usermode_selftest
+    // feature, run the legacy ring-3 self-test instead (regression
+    // artifact). Exactly one of these compiles, and each diverges.
+    #[cfg(not(feature = "usermode_selftest"))]
+    {
+        root::handoff(&mut com1, usable_bytes, hhdm_offset);
+        // kernel_main idles and creates nothing further. yield_now hands
+        // the CPU to the root task (and the self-test's own looping
+        // tasks) without needing a timer, which this sandbox's QEMU/TCG
+        // never delivers; hlt parks between rounds on real hardware.
+        loop {
+            scheduler::yield_now();
+            unsafe { core::arch::asm!("hlt") }
+        }
+    }
+
+    #[cfg(feature = "usermode_selftest")]
     usermode_selftest(&mut com1)
 }
 
@@ -429,7 +450,9 @@ fn timer_selftest(com1: &mut console::Dual) {
 // DOUBLE_FAULT_STACK, a separate static rather than reusing whatever
 // stack kernel_main happens to be running on, since that one is still
 // in use by the very call frame that's about to go one-way into ring 3.
+#[cfg(feature = "usermode_selftest")]
 const KERNEL_SCRATCH_STACK_SIZE: usize = 4096 * 4;
+#[cfg(feature = "usermode_selftest")]
 static mut KERNEL_SCRATCH_STACK: [u8; KERNEL_SCRATCH_STACK_SIZE] = [0; KERNEL_SCRATCH_STACK_SIZE];
 
 /// Maps a code page and a stack page as USER, copies the hand-written
@@ -440,6 +463,7 @@ static mut KERNEL_SCRATCH_STACK: [u8; KERNEL_SCRATCH_STACK_SIZE] = [0; KERNEL_SC
 /// docs. This is why it's the last thing kernel_main calls, and why the
 /// old trailing `loop { hlt }` that used to sit here is gone, it would
 /// have been unreachable code once this diverges instead.
+#[cfg(feature = "usermode_selftest")]
 fn usermode_selftest(com1: &mut console::Dual) -> ! {
     // Both arbitrary, page-aligned, and far below the kernel's
     // higher-half virtual range and the HHDM range alike, guaranteeing
