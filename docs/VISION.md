@@ -10,43 +10,41 @@ Rose is not just a capability microkernel. That is the foundation, not the goal.
 - Carries zero commercial cruft: no telemetry, no ads, no forced accounts, no bloat kept alive for a business model Rose does not have.
 - Understands, in real time, how it is actually being used, and adapts to the person using it instead of forcing the person to adapt to it.
 
-That last point is what makes Rose more than a clean microkernel, and it is the part most easily misunderstood, so most of this document is about getting it right.
+That last point is what makes Rose more than a clean microkernel, and most of this document is about it.
 
-## The intelligence is not a layer, and it is not in the kernel
+## The kernel is reflex, the intelligence is a faculty
 
-The instinct is to picture "the smart part" as a box sitting on top, or worse, baked into the kernel so the system can "decide" things. Both are wrong, and the distinction is the whole design.
+The kernel, Rose itself, is reflex. It is the arbiter of authority: it enforces capabilities, enforces isolation, and owns the allocation of CPU and memory. It settles what is permitted to happen and leaves what should happen to the layers above it. A component proposes, the kernel authorizes, the person grants, and those three roles stay separate. A reasoner living in the kernel would swell the trusted core and break the footprint guarantee below, so the kernel stays reflexive and the thinking lives elsewhere.
 
-The kernel (Rose itself) is reflex, not intelligence. It is the arbiter of authority: it enforces capabilities, enforces isolation, and owns the allocation of CPU and memory. It does not reason about what should happen; it enforces what is permitted to happen. A component proposes, the kernel authorizes, the person grants. Those three roles never collapse into one. Putting a reasoner in the kernel would swell the trusted core, break the footprint guarantee below, and quietly turn Rose back into the kind of system it exists to replace.
-
-The intelligence is a faculty, not a place. It does four things: it maps inputs into a coherent picture, it passes useful patterns down into faster layers, it surfaces what is needed in the moment up to where a decision gets made, and it stores what may be needed later. It is deep in the system in the sense that it is pervasive and mostly runs below conscious attention, the way most of a brain's work never reaches awareness. It is not deep in the sense of privilege. It holds only the authority it was granted, inside a hard footprint bound it cannot raise.
+The intelligence is a faculty that runs across the whole system. It maps inputs into a coherent picture, passes useful patterns down into faster layers, surfaces what is needed in the moment up to where a decision gets made, and stores what may be needed later. It is pervasive, and most of it runs below conscious attention, the way most of a brain's work never reaches awareness. Its reach is wide and its authority is narrow: it holds only what it was granted, inside a hard footprint bound it cannot raise.
 
 ## How the layers sit
 
-Borrowing the shape of a nervous system, because it turns out to fit:
+The shape of a nervous system fits this well:
 
-- Sensing (Stem): an afferent layer that watches hardware, software, program usage, and activity. It judges nothing and reports everything. It is not a control layer wedged between the kernel and the rest; it is the sensory wiring that feeds every layer holding a capability to listen.
-- Reflex (Rose, the kernel): the autonomous layer. Non-optional, fast, consulted by nothing at its floor. It keeps the hardware safe and the components isolated. Part of it is an untrainable floor that can never be modified; the rest can be influenced within bounds.
-- Modulation (the resource policy): a semi-autonomous layer that can influence the reflex layer but never seize it. It biases allocation within ranges the kernel still owns and can override. It runs on its own, inside bounds granted once.
-- Intent (Compass and the person): the manual, deliberate layer. This is where a decision is negotiated and consent is given. Compass is the digestible interface to the person, the part of the intelligence that surfaces into view. It is the tip, not the whole.
+- Sensing (Stem): an afferent layer that watches hardware, software, program usage, and activity. It keeps baselines, reports what it sees, and judges nothing. It is the sensory wiring of the system, feeding every layer that holds a capability to listen.
+- Reflex (Rose, the kernel): the autonomous layer. Fast, non-optional, and consulted by nothing at its floor. It keeps the hardware safe and the components isolated. An untrainable floor can never be modified; the tier above it can be influenced within bounds.
+- Modulation (the resource policy): a semi-autonomous layer that influences the reflex layer within bounds. It biases allocation inside ranges the kernel owns and can override, running on its own inside limits granted once.
+- Intent (Compass and the person): the manual, deliberate layer, where a decision is negotiated and consent is given. Compass is the interface to the person and the visible surface of the intelligence.
 
 Two rules hold this together:
 
-- Intent flows down, veto flows up. Influence and intent propagate from the manual layer toward the reflex layer; safety authority propagates the other way. The untrainable floor overrides any intent, any policy, and any learned behavior. Nothing above it can talk it out of protecting the system, the same way a person cannot will their heart to stop.
-- The watcher cannot become what it watches. Whatever runs the sensing and the intelligence lives inside a bounded footprint the kernel enforces. The whole point is catching things that waste the machine; it would be a joke if the catcher became the thing worth catching. So the bound is structural, not a polite budget.
+- Intent flows down, veto flows up. Influence and intent propagate from the manual layer toward the reflex layer; safety authority propagates the other way. The untrainable floor overrides any intent, any policy, and any learned behavior, the same way a person cannot will their heart to stop.
+- The watcher stays inside a bounded footprint the kernel enforces. The whole point is catching things that waste the machine; a catcher that became the thing worth catching would be a joke. The bound is structural: the kernel enforces it, and nothing above can raise it.
 
 ## How it learns
 
-The only training signal is what the person tells it when it asks: yes, no, or do it differently. Nothing external, nothing phoned out, nothing aggregated with strangers. If it gets better at what to suggest, that is because the person taught it, not because a server somewhere pooled everyone's usage.
+The only training signal is what the person tells it when it asks: yes, no, or do it differently. Nothing is phoned out or aggregated with strangers. It gets better at what to suggest because the person taught it.
 
-Learning, concretely, is a behavior descending the layer stack as trust accrues. A response starts as something Compass asks about every time (manual). Approved enough, and told to remember, it drops to running on its own within bounds (modulation). In the rare, tightly bounded cases where it has earned it, it consolidates into a trained reflex. This is the same path a person takes turning a deliberate skill into muscle memory, and it is gated the same way: slowly, under supervision, and never into the untrainable floor.
+Learning is a behavior descending the layer stack as trust accrues. A response starts as something Compass asks about every time (manual). Approved enough, and told to remember, it drops to running on its own within bounds (modulation). In the rare, tightly bounded cases where it has earned it, it consolidates into a trained reflex. This is the path a person takes turning a deliberate skill into muscle memory, gated the same way: slowly, under supervision, and never into the untrainable floor.
 
-## It is optional, and yet it is part of what Rose is
+## Substrate and tenant
 
-Both are true, and they stop contradicting each other once the substrate is separated from the tenant.
+Two parts carry different obligations.
 
-The substrate is first-class and always present, even in a build with no intelligence at all: the way the kernel exposes safe observation, the single path by which a human yes becomes authority, the footprint bound, and the gate through which a reflex can ever be trained. That machinery is part of what Rose is.
+The substrate is always present, even in a build with no intelligence at all: the way the kernel exposes safe observation, the single path by which a human yes becomes authority, the footprint bound, and the gate through which a reflex can be trained. This machinery is part of what Rose is.
 
-The tenant is the intelligence itself, Stem and Compass. That is optional. A build of Rose with neither is still a complete, working operating system. The intelligence is a layer you can leave out, not a tax you have to pay to run the thing at all.
+The tenant is the intelligence itself, Stem and Compass. A build of Rose without them is still a complete, working operating system. The intelligence is a layer you can leave out.
 
 ## Heuristic: bespoke vs. standard
 
