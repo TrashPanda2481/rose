@@ -34,6 +34,13 @@ pub const SYS_ENDPOINT_SEND: u64 = 0x1007;
 pub const SYS_ENDPOINT_RECEIVE: u64 = 0x1008;
 pub const SYS_ENDPOINT_CALL: u64 = 0x1009;
 pub const SYS_ENDPOINT_REPLY: u64 = 0x100A;
+/// Root task's own report syscall (Phase 1 boot handoff). Outside the
+/// 0x1000-0x100A capability-op range on purpose: it carries no cap
+/// operation, just three values (BootInfo magic, readback, expected)
+/// the kernel verifies and logs. Handled directly in idt.rs, not here.
+/// See kernel/src/root.rs.
+#[cfg(not(feature = "usermode_selftest"))]
+pub const SYS_ROOT_REPORT: u64 = 0x2000;
 
 /// Frame-Map's own flags argument: a small, clean bitfield instead of
 /// raw hardware PTE bits. paging.rs's PAGE_* constants are an
