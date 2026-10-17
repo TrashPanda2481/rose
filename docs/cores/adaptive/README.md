@@ -25,7 +25,7 @@ It is pervasive in what it touches and limited to the authority it holds. Two na
 Full picture in VISION. The seams each layer exposes:
 
 - Reflex (kernel): an untrainable floor plus a modulated-autonomic tier. Exposes a bounded reflex-registration gate (below).
-- Modulation (resource policy): influences allocation within bounds; the fast loop acts on its own inside limits granted once, and hard-safety responses stay autonomous because asking is too slow.
+- Modulation (the resource-manager): its own bounded component, separate from Compass, so the fast loop runs even in a build with no interface layer. It influences allocation within bounds; the fast loop acts on its own inside limits granted once, and hard-safety responses stay autonomous because asking is too slow.
 - Manual (Compass + person): consent-gated, deliberate.
 - Sensing (Stem): feeds all of the above.
 
@@ -33,7 +33,7 @@ Invariant, repeated here because the floor below depends on it: intent flows dow
 
 ## The untrainable floor
 
-This is the decision the rest of the design hangs on, and the first thing to ratify before any code. The floor is the set of kernel behaviors that stay pure reflex: consulted by nothing, modifiable by no one, never consolidatable into from above. It is at once the system's safety guarantee and the hard ceiling on what the intelligence may ever install. Everything off this list is influenceable or trainable within bounds.
+This is the decision the rest of the design hangs on, ratified before any code. The floor is the set of kernel behaviors that stay pure reflex: consulted by nothing, modifiable by no one, never consolidatable into from above. It is at once the system's safety guarantee and the hard ceiling on what the intelligence may ever install. Everything off this list is influenceable or trainable within bounds.
 
 On the floor (inviolable, never trainable):
 
@@ -44,8 +44,9 @@ On the floor (inviolable, never trainable):
 5. Revocation. A revoke (a cut in the derivation tree) always completes. The intelligence cannot block, slow, or train away revocation of its own authority.
 6. The footprint bound on the intelligence itself. The cap on what Stem, Compass, and the learner may consume is enforced by the kernel and stays beyond the reach of the thing it bounds.
 7. Hardware-safety hard cutoffs (design intent, not yet implemented). When Rose grows real hardware-safety sensing, its emergency responses (for example an overtemp halt) sit on the floor: they fire autonomously and stay beyond training or policy suppression.
+8. The human-control path is never starved (design intent, not yet implemented). The path by which the person observes, consents, and revokes holds a guaranteed minimum of CPU and memory, so it keeps working even while the machine is under load. It is the dual of item 6: item 6 caps what the intelligence may consume, item 8 reserves what the control path always gets. It waits on scheduler reservations the round-robin scheduler does not have yet.
 
-Items 1 through 6 map onto mechanisms the kernel already has (cap/rights checks, paging W^X, the IDT fault path, the mint path, the CSpace derivation tree, and a bounded Untyped). Item 7 is forward-looking, named here so it is not forgotten.
+Items 1 through 6 map onto mechanisms the kernel already has (cap/rights checks, paging W^X, the IDT fault path, the mint path, the CSpace derivation tree, and a bounded Untyped). Items 7 and 8 are forward-looking, named here so they are not forgotten.
 
 Off the floor (influenceable, consolidatable under consent): allocation strategy (priority bias, which non-essential work to suspend, prefetch and cache hints, scheduling bias within safe ranges), salience and surfacing choices, which suggestions to make and when, and profile or preference adaptation.
 
@@ -57,12 +58,12 @@ Learning is a behavior descending the layer stack as trust accrues. The person's
 - remember and do it automatically: drops to modulation, runs on its own within bounds,
 - earned, rare, and tightly bounded: consolidates into a trained reflex through the registration gate.
 
-Grounding (how it knows what is what), in order of how much to trust the source:
+Grounding (how it knows what is what) is structural-first, in this trust order:
 1. the capability and IPC graph as semantic substrate: a component's purpose is legible from the capabilities it holds and the endpoints it talks to, which is hard to fake and is a Rose-native advantage a Unix or NT system lacks,
 2. a component's self-declared manifest, read as a claim checked against the graph (the kernel's own verify-before-commit principle applied to identity),
 3. labels the person gives, where every consent dialogue is one labeled example.
 
-The learner stays small, local, and interpretable: rules and thresholds, a tiny local model, a bounded case memory. The footprint ceiling is enforced structurally through bounded capabilities, so the construction itself keeps the watcher from ever becoming the thing worth catching. A fresh install knows nothing about the person and stays humble early, asking more and assuming less, earning autonomy over time. The intelligence is the person's own, non-transferable, and built only from what happens on the machine.
+The learner stays small, local, and interpretable: rules and thresholds plus a bounded case memory. Every suggestion traces to a rule or a past decision, so no opaque model sits in the authority path. The footprint ceiling is enforced structurally through bounded capabilities, so the construction itself keeps the watcher from ever becoming the thing worth catching. A fresh install knows nothing about the person and stays humble early, asking more and assuming less, earning autonomy over time. The intelligence is the person's own, non-transferable, and built only from what happens on the machine.
 
 ## How it acts
 
@@ -70,7 +71,7 @@ Authority enters through a single chokepoint, the consent broker: a human yes is
 
 ## The reflex-training gate
 
-The kernel learns without changing its own code. It exposes a bounded, verified, capability-gated registration facility for fast-path rules (condition then pre-authorized action). The verifier holds the untrainable floor as the hard limit: a registered reflex acts quickly and without consultation, and still cannot violate items 1 through 7. The prior art with the right shape is eBPF (userspace installs small verified programs that run in the kernel fast path under a verifier's limits); Rose's version is the same idea, capability-scoped and bounded.
+The kernel learns without changing its own code. It exposes a bounded, verified, capability-gated registration facility for fast-path rules (condition then pre-authorized action). The verifier holds the untrainable floor as the hard limit: a registered reflex acts quickly and without consultation, and still cannot violate items 1 through 8. The prior art with the right shape is eBPF (userspace installs small verified programs that run in the kernel fast path under a verifier's limits); Rose's version is the same idea, capability-scoped and bounded.
 
 ## Scope: v1 is system health only
 
@@ -82,12 +83,20 @@ Compass has two jobs of uneven difficulty. System health (is the machine ok) gro
 - An observe capability or right in the kernel's `Rights` set, decided when the root task first hands out capabilities, since the root task is the only authority that could ever grant system-wide observation while withholding system-wide power.
 - The consent broker as the single mint chokepoint.
 - A bounded Untyped for the intelligence's own footprint.
+- Scheduler reservations for floor items 7 and 8.
 - Later, the reflex-registration gate.
 
-## Open decisions
+## Decisions settled (2026-10-17)
 
-- Ratify the untrainable floor above.
-- Grounding mix: primarily structural (capability graph) or primarily declared and taught (manifests plus labels).
-- Learner style: interpretable (rules plus case memory) or adaptive (a small opaque model). The vision leans interpretable.
-- Whether routine resource allocation acts autonomously within granted bounds (current lean: yes) or asks each time.
-- Where allocation policy lives: its own resource-manager component, or inside Compass.
+- Untrainable floor: ratified, with the human-control-path minimum added as item 8.
+- Grounding: structural-first. The capability graph leads; manifests and labels enrich it.
+- Learner: interpretable only, rules plus a bounded case memory, no opaque model in the authority path.
+- Resource-allocation policy: its own resource-manager component, separate from Compass.
+- Autonomy: the fast loop acts on its own within bounds granted once.
+
+## Still open (for when the component model lands)
+
+- The exact encoding of the observe capability or right in the kernel's `Rights` set.
+- The manifest schema, and how a manifest is checked against the capability graph.
+- The case memory's size bound and eviction policy.
+- The reflex-registration gate's verifier: what a fast-path rule may express, and how the floor is proven as its hard limit.
