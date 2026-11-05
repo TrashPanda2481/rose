@@ -553,3 +553,119 @@ impl AddressSpace {
 unsafe fn invlpg(virt: u64) {
     core::arch::asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags));
 }
+
+// ---------------------------------------------------------------------------
+// Typed user-mapping boundary.
+//
+// The checks that gate a ring-3-originated mapping used to live as inline
+// `if ... return Err` guards in syscall::dispatch_frame_map, standing in
+// front of a call to the raw `map_page(virt: u64, ...)` primitive. That made
+// each check something a human had to remember to write at every call site: a
+// rule on the wall, not an enforced one. It is exactly the shape of the
+// SYS_FRAME_MAP escalation in docs/cores/kernel/BUGS.md, the one time the rule
+// lived only in a reviewer's head and got missed.
+//
+// These newtypes move the rules into the type system. Each wraps a raw value
+// behind a PRIVATE field, so the only way to obtain the typed value is through
+// the constructor that runs the check. `map_user_page` below accepts only
+// these types, so a raw address, the kernel's own address space, or a W+X
+// flag set cannot be passed to it: they do not type-check. The check is no
+// longer in front of the use; it is the use's only ingredient, and a future
+// call site that forgets it is a compile error, not a CVE.
+//
+// Where the type stops: `map_page`/`map_4k` below still take raw u64s, because
+// the hardware page tables take raw numbers and no type the MMU understands
+// exists. That is the single trusted "untyped room". It stays `unsafe` and is
+// reached from the syscall path only through `map_user_page`, which is the one
+// bridge from typed to untyped. The type carries the proof right up to that
+// room's door; inside it, the three lines were audited once.
+
+/// A virtual address proven legal as a USER mapping target: 4K-aligned and
+/// outside the kernel-shared upper half. Private field, so `try_user` is the
+/// only constructor. This is Rule 1 (range) made structural.
+#[derive(Clone, Copy)]
+pub struct UserVaddr(u64);
+
+/// Why a u64 is not a legal user vaddr.
+#[derive(Debug, PartialEq, Eq)]
+pub enum VaddrError {
+    /// Not 4K-aligned.
+    Misaligned,
+    /// Falls in SHARED_PML4_RANGE, the half every AddressSpace shares by
+    /// physical reference with the kernel's own tables (`is_shared_vaddr`).
+    NotPrivate,
+}
+
+impl UserVaddr {
+    /// The one parse. Rule 1 lives here and nowhere else: the same alignment
+    /// and private-half checks dispatch_frame_map used to do inline, now the
+    /// only path to a UserVaddr.
+    pub fn try_user(virt: u64) -> Result<Self, VaddrError> {
+        if virt % FRAME_SIZE != 0 {
+            return Err(VaddrError::Misaligned);
+        }
+        if is_shared_vaddr(virt) {
+            return Err(VaddrError::NotPrivate);
+        }
+        Ok(UserVaddr(virt))
+    }
+}
+
+/// An AddressSpace proven not to be the kernel's own live tables. Private
+/// field; `AddressSpace::into_user` is the only constructor. This is the
+/// address-space half of Rule 2 (the cap type/rights half stays in CSpace).
+pub struct UserAddressSpace(AddressSpace);
+
+/// Why an AddressSpace is not a legal user mapping target.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AsError {
+    /// It resolved to the kernel's own AddressSpace.
+    IsKernel,
+}
+
+impl AddressSpace {
+    /// Narrow this handle to a user-mapping target, rejecting the kernel's
+    /// own address space. The only constructor for `UserAddressSpace`.
+    pub fn into_user(self) -> Result<UserAddressSpace, AsError> {
+        if self.is_kernel() {
+            return Err(AsError::IsKernel);
+        }
+        Ok(UserAddressSpace(self))
+    }
+}
+
+/// PTE flags built from a user request with the kernel's invariants already
+/// baked in: PAGE_USER is always set, and a writable mapping is always forced
+/// non-executable (W^X). A `UserMapFlags` therefore cannot describe a page
+/// that is both writable and executable. This is Rule 3's invariant half.
+#[derive(Clone, Copy)]
+pub struct UserMapFlags(u64);
+
+impl UserMapFlags {
+    /// Build from the caller's two decoded knobs. Everything structural is
+    /// decided here, not by the caller: W^X is not optional, so a writable
+    /// page is always NX regardless of `want_nx`.
+    pub fn user(want_write: bool, want_nx: bool) -> Self {
+        let mut flags = PAGE_USER;
+        if want_write {
+            flags |= PAGE_WRITABLE;
+        }
+        if want_write || want_nx {
+            flags |= PAGE_NO_EXECUTE;
+        }
+        UserMapFlags(flags)
+    }
+}
+
+impl UserAddressSpace {
+    /// The only mapping entry point reachable from the syscall layer. It is
+    /// SAFE at the call site: every invariant `map_4k` relies on is already
+    /// proven by the argument types (a private, aligned user vaddr; a
+    /// non-kernel address space; W^X-clean, user-flagged bits), so the
+    /// `unsafe` collapses into the raw primitive this wraps. `frame_phys`
+    /// stays a raw u64 on purpose: it is the physical address the Frame cap
+    /// already resolved to inside the kernel, not a ring-3-chosen number.
+    pub fn map_user_page(&self, virt: UserVaddr, frame_phys: u64, flags: UserMapFlags) {
+        unsafe { self.0.map_page(virt.0, frame_phys, flags.0) };
+    }
+}

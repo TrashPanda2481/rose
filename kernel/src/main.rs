@@ -23,6 +23,8 @@ mod timer;
 mod untyped;
 #[cfg(feature = "usermode_selftest")]
 mod usermode;
+#[cfg(feature = "fake_app_rule1")]
+mod fake_apps;
 #[cfg(not(feature = "usermode_selftest"))]
 mod root;
 

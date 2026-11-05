@@ -19,6 +19,13 @@ abi = { package = "rose-abi", path = "../abi" }
 # docs/cores/kernel/plans/root-task-handoff.md.
 usermode_selftest = []
 
+# Teaching "fake app": a deliberate Rule-1 (range) violation that hands the
+# typed user-mapping boundary a raw address aimed at the kernel-shared half.
+# Off by default. Building with it on MUST fail to compile, because UserVaddr
+# cannot be bypassed; a clean build with this feature would mean the typed
+# boundary has a hole. See kernel/src/fake_apps.rs.
+fake_app_rule1 = []
+
 [profile.dev]
 panic = "abort"
 
