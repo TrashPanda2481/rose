@@ -59,7 +59,9 @@
 //     anything into it here; it's an empty address space until some
 //     future Frame.Map syscall populates it.
 
-use crate::cspace::{CSpace, CSpaceError};
+use crate::cspace::CSpace;
+#[cfg(feature = "usermode_selftest")]
+use crate::cspace::CSpaceError;
 use crate::endpoint::{self, EndpointObject};
 use crate::mem::{self, SpinLock};
 use crate::paging;
@@ -329,6 +331,7 @@ pub fn retype(untyped_id: u64, object_type: ObjectType) -> Result<u64, UntypedEr
 /// empty"), but this is a one-off internal helper reusing `CSpace`'s
 /// own small error type rather than inventing a third error enum for
 /// a single caller.
+#[cfg(feature = "usermode_selftest")]
 pub fn grant_into_cspace(
     cspace_id: u64,
     dst: abi::CPtr,

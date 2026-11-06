@@ -1,0 +1,9 @@
+# Normalize every text file to LF in the repository and in the working
+# tree, on all platforms, so an edit or checkout on Windows can't flip the
+# whole tree to CRLF and bury real diffs under line-ending churn. Binary
+# files are auto-detected by text=auto and left untouched.
+* text=auto eol=lf
+
+# Shell scripts must stay LF so they run under bash on every platform
+# (Git Bash's cygwin bash chokes on CRLF shebangs). Applies to tools/*.sh.
+*.sh text eol=lf

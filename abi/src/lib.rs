@@ -146,3 +146,37 @@ pub struct Capability {
     pub rights: Rights,
     pub badge: u64,
 }
+
+/// Plain data the boot handoff hands the root task: a snapshot of what
+/// the root needs and cannot derive for itself. Not a capability; the
+/// kernel maps one of these read-only into the root AddressSpace (see
+/// kernel/src/root.rs and docs/cores/kernel/plans/root-task-handoff.md).
+/// `repr(C)` with a fixed field order on purpose: the root program reads
+/// it by offset, so this layout is ABI and must not be reordered. A
+/// compact summary for increment 1; the raw memory map comes later, when
+/// the loader needs it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BootInfo {
+    /// Sanity/version marker the root reads first (offset 0) to confirm
+    /// it is looking at a real BootInfo page, not zeroed or stale memory.
+    pub magic: u64,
+    /// Total usable physical memory, in bytes.
+    pub usable_bytes: u64,
+    /// Higher-half direct-map offset: phys + this is a kernel-readable
+    /// virtual alias of that physical address.
+    pub hhdm_offset: u64,
+    /// Linear framebuffer base, or 0 if the system has no framebuffer.
+    pub fb_addr: u64,
+    pub fb_width: u32,
+    pub fb_height: u32,
+    pub fb_pitch: u32,
+    pub fb_bpp: u16,
+    pub _reserved: u16,
+}
+
+impl BootInfo {
+    /// Marks a page as a real BootInfo. "RoseBI01" in ASCII; bump it if
+    /// the layout ever changes incompatibly.
+    pub const MAGIC: u64 = 0x526f_7365_4249_3031;
+}

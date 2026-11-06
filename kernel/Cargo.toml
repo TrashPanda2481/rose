@@ -11,6 +11,28 @@ path = "src/main.rs"
 limine = "0.6.5"
 abi = { package = "rose-abi", path = "../abi" }
 
+[features]
+# The legacy ring-3 self-test (kernel/src/usermode.rs). Off by default:
+# a normal boot hands off to the root task instead. Kept as an opt-in
+# regression artifact, since it exercises CSpace/Untyped/IPC error paths
+# the root program does not. See
+# docs/cores/kernel/plans/root-task-handoff.md.
+usermode_selftest = []
+
+# Teaching "fake app": a deliberate Rule-1 (range) violation that hands the
+# typed user-mapping boundary a raw address aimed at the kernel-shared half.
+# Off by default. Building with it on MUST fail to compile, because UserVaddr
+# cannot be bypassed; a clean build with this feature would mean the typed
+# boundary has a hole. See kernel/src/fake_apps.rs.
+fake_app_rule1 = []
+
+# Second fake app: the private-field door. Forges a UserVaddr by hand from a
+# sibling module; MUST fail to compile (E0423) because the field is private to
+# paging. A clean build with this feature would mean the field was made pub or
+# a crate-visible constructor was added -- the load-bearing brick gone. See
+# kernel/src/fake_apps.rs.
+fake_app_rule1_forge = []
+
 [profile.dev]
 panic = "abort"
 

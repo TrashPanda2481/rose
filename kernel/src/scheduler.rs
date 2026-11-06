@@ -379,6 +379,7 @@ pub fn with_current_cspace<R>(f: impl FnOnce(&mut CSpace) -> R) -> R {
 /// cli/sti reasoning as `yield_now`'s own bracket: a tick landing
 /// mid-update could see a half-written Task, or spin forever trying to
 /// re-lock SCHEDULER against itself.
+#[cfg(feature = "usermode_selftest")]
 pub fn set_current_address_space(new_as: AddressSpace) {
     unsafe {
         core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
@@ -405,6 +406,7 @@ pub fn set_current_address_space(new_as: AddressSpace) {
 /// replacing its old one-time raw `gdt::set_kernel_stack` call so task
 /// 0's own `kernel_stack_top` field is recorded, not just applied once
 /// and then forgotten by the scheduler.
+#[cfg(feature = "usermode_selftest")]
 pub fn set_current_kernel_stack(rsp0: u64) {
     unsafe {
         core::arch::asm!("cli", options(nomem, nostack, preserves_flags));

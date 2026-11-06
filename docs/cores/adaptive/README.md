@@ -1,19 +1,102 @@
 # Adaptive core
 
-Status: deferred. No spec, no code. Placeholder so the goal isn't forgotten.
+Status: spec, not built. The kernel has reached the scheduler + IPC round-trip this core was waiting on (see `docs/cores/kernel/README.md`), so this is the first real design, replacing the earlier placeholder. No code yet; building waits on the Phase 1 component model in `docs/TRANSITION.md`.
 
 ## What this is
 
-The real-time usage/intent layer described in `docs/VISION.md`. The native successor to Compass (the guidance app from the Meridian-OS project): same idea, but as an OS-level capability instead of a userspace tool sitting on top of a generic system.
+The intelligent layer described in `docs/VISION.md`: the native successor to Compass. An OS-level faculty that observes the system, learns only from the person, and acts only through authority the person granted. This document is the design; VISION is the why.
 
-## Why there's nothing here yet
+## The shape
 
-This core observes and acts on other components. It can't be designed sensibly before those components exist:
+Intelligence here is a faculty spread across the system. It performs four operations:
 
-- Needs the capability model and IPC working (ground-zero steps 3-4)
-- Needs a scheduler and real running components
-- Needs enough of a component graph that "usage" has something to refer to
+- map: build a coherent picture from raw signal,
+- consolidate: push proven patterns down into faster layers,
+- surface: raise what is needed in the moment up to where a decision is made,
+- store: retain what may be needed later.
 
-## Next step
+It is pervasive in what it touches and limited to the authority it holds. Two named pieces carry it:
 
-Once the kernel core reaches a working scheduler + IPC round-trip, come back here and start a real spec. Until then, this file is just a marker.
+- Stem: observe-only sensing. Keeps baselines, notices deviation, reports it, judges nothing. Its whole job is noticing that something is different than usual, which needs no model of what anything means and is why it is safe to let it watch broadly. Stem is afferent: a shared sensor bus feeding every layer that holds a scoped observe capability.
+- Compass: the reasoner and the interface. It decides whether a flagged change matters, forms a guess at cause, and if action is warranted, proposes it to the person in plain terms: what it noticed, what it thinks is going on, what it wants to do, what to expect, then it waits for a yes. Saying yes is the only way it gets authority to act, and it keeps that authority afterward only when told to remember the decision.
+
+## The layers it plugs into
+
+Full picture in VISION. The seams each layer exposes:
+
+- Reflex (kernel): an untrainable floor plus a modulated-autonomic tier. Exposes a bounded reflex-registration gate (below).
+- Modulation (the resource-manager): its own bounded component, separate from Compass, so the fast loop runs even in a build with no interface layer. It influences allocation within bounds; the fast loop acts on its own inside limits granted once, and hard-safety responses stay autonomous because asking is too slow.
+- Manual (Compass + person): consent-gated, deliberate.
+- Sensing (Stem): feeds all of the above.
+
+Invariant, repeated here because the floor below depends on it: intent flows down, veto flows up. The untrainable floor overrides any intent, policy, or learned behavior.
+
+## The untrainable floor
+
+This is the decision the rest of the design hangs on, ratified before any code. The floor is the set of kernel behaviors that stay pure reflex: consulted by nothing, modifiable by no one, never consolidatable into from above. It is at once the system's safety guarantee and the hard ceiling on what the intelligence may ever install. Everything off this list is influenceable or trainable within bounds.
+
+On the floor (inviolable, never trainable):
+
+1. Capability and rights enforcement. Every invocation is checked against the capabilities actually held. No learned shortcut and no fast path ever skips the check.
+2. Address-space isolation and W^X. A component reaches only the memory it holds a capability for. The kernel enforces this unconditionally.
+3. CPU exception and fault handling. A fault is contained by the kernel immediately: fault the offending component, not the system. Policy never defers or suppresses a fault.
+4. The authority-granting path. Only the consent broker, blessed by the root task, mints capabilities. The intelligence can never grant itself authority, and nothing can train it to.
+5. Revocation. A revoke (a cut in the derivation tree) always completes. The intelligence cannot block, slow, or train away revocation of its own authority.
+6. The footprint bound on the intelligence itself. The cap on what Stem, Compass, and the learner may consume is enforced by the kernel and stays beyond the reach of the thing it bounds.
+7. Hardware-safety hard cutoffs (design intent, not yet implemented). When Rose grows real hardware-safety sensing, its emergency responses (for example an overtemp halt) sit on the floor: they fire autonomously and stay beyond training or policy suppression.
+8. The human-control path is never starved (design intent, not yet implemented). The path by which the person observes, consents, and revokes holds a guaranteed minimum of CPU and memory, so it keeps working even while the machine is under load. It is the dual of item 6: item 6 caps what the intelligence may consume, item 8 reserves what the control path always gets. It waits on scheduler reservations the round-robin scheduler does not have yet.
+
+Items 1 through 6 map onto mechanisms the kernel already has (cap/rights checks, paging W^X, the IDT fault path, the mint path, the CSpace derivation tree, and a bounded Untyped). Items 7 and 8 are forward-looking, named here so they are not forgotten.
+
+Off the floor (influenceable, consolidatable under consent): allocation strategy (priority bias, which non-essential work to suspend, prefetch and cache hints, scheduling bias within safe ranges), salience and surfacing choices, which suggestions to make and when, and profile or preference adaptation.
+
+## How it learns
+
+Learning is a behavior descending the layer stack as trust accrues. The person's three consent modes are the waypoints on one consolidation gradient:
+
+- handle once: stays manual, Compass asks every time,
+- remember and do it automatically: drops to modulation, runs on its own within bounds,
+- earned, rare, and tightly bounded: consolidates into a trained reflex through the registration gate.
+
+Grounding (how it knows what is what) is structural-first, in this trust order:
+1. the capability and IPC graph as semantic substrate: a component's purpose is legible from the capabilities it holds and the endpoints it talks to, which is hard to fake and is a Rose-native advantage a Unix or NT system lacks,
+2. a component's self-declared manifest, read as a claim checked against the graph (the kernel's own verify-before-commit principle applied to identity),
+3. labels the person gives, where every consent dialogue is one labeled example.
+
+The learner stays small, local, and interpretable: rules and thresholds plus a bounded case memory. Every suggestion traces to a rule or a past decision, so no opaque model sits in the authority path. The footprint ceiling is enforced structurally through bounded capabilities, so the construction itself keeps the watcher from ever becoming the thing worth catching. A fresh install knows nothing about the person and stays humble early, asking more and assuming less, earning autonomy over time. The intelligence is the person's own, non-transferable, and built only from what happens on the machine.
+
+## How it acts
+
+Authority enters through a single chokepoint, the consent broker: a human yes is the only thing that mints Compass a capability, and the three modes map to an ephemeral capability (handle once), a stored automation rule that re-mints on the same trigger (remember), or a suppression entry (never ask). Autonomy is therefore a delegated, revocable capability: granted one situation at a time, taken back with one cut of the derivation tree. Badges (not yet built, IPC increment 3) would carry provenance on minted capabilities.
+
+## The reflex-training gate
+
+The kernel learns without changing its own code. It exposes a bounded, verified, capability-gated registration facility for fast-path rules (condition then pre-authorized action). The verifier holds the untrainable floor as the hard limit: a registered reflex acts quickly and without consultation, and still cannot violate items 1 through 8. The prior art with the right shape is eBPF (userspace installs small verified programs that run in the kernel fast path under a verifier's limits); Rose's version is the same idea, capability-scoped and bounded.
+
+## Scope: v1 is system health only
+
+Compass has two jobs of uneven difficulty. System health (is the machine ok) grounds cleanly in signals, baselines, and the capability graph. Understanding what the person is working on (intent and workflow) means modeling the person from impoverished, indirect signals, which is a genuinely open problem. v1 is system-health only; intent inference is a later, opt-in frontier.
+
+## What it needs from the rest of Rose first
+
+- The Phase 1 component model (`docs/TRANSITION.md`): there is nothing to observe or act through until components exist at runtime.
+- An observe capability or right in the kernel's `Rights` set, decided when the root task first hands out capabilities, since the root task is the only authority that could ever grant system-wide observation while withholding system-wide power.
+- The consent broker as the single mint chokepoint.
+- A bounded Untyped for the intelligence's own footprint.
+- Scheduler reservations for floor items 7 and 8.
+- Later, the reflex-registration gate.
+
+## Decisions settled (2026-10-17)
+
+- Untrainable floor: ratified, with the human-control-path minimum added as item 8.
+- Grounding: structural-first. The capability graph leads; manifests and labels enrich it.
+- Learner: interpretable only, rules plus a bounded case memory, no opaque model in the authority path.
+- Resource-allocation policy: its own resource-manager component, separate from Compass.
+- Autonomy: the fast loop acts on its own within bounds granted once.
+
+## Still open (for when the component model lands)
+
+- The exact encoding of the observe capability or right in the kernel's `Rights` set.
+- The manifest schema, and how a manifest is checked against the capability graph.
+- The case memory's size bound and eviction policy.
+- The reflex-registration gate's verifier: what a fast-path rule may express, and how the floor is proven as its hard limit.

@@ -14,7 +14,6 @@
 
 use crate::cspace::{CSpace, CSpaceError};
 use crate::endpoint::{self, EndpointError, Message};
-use crate::mem;
 use crate::paging;
 use crate::reply;
 use crate::scheduler;
@@ -34,6 +33,13 @@ pub const SYS_ENDPOINT_SEND: u64 = 0x1007;
 pub const SYS_ENDPOINT_RECEIVE: u64 = 0x1008;
 pub const SYS_ENDPOINT_CALL: u64 = 0x1009;
 pub const SYS_ENDPOINT_REPLY: u64 = 0x100A;
+/// Root task's own report syscall (Phase 1 boot handoff). Outside the
+/// 0x1000-0x100A capability-op range on purpose: it carries no cap
+/// operation, just three values (BootInfo magic, readback, expected)
+/// the kernel verifies and logs. Handled directly in idt.rs, not here.
+/// See kernel/src/root.rs.
+#[cfg(not(feature = "usermode_selftest"))]
+pub const SYS_ROOT_REPORT: u64 = 0x2000;
 
 /// Frame-Map's own flags argument: a small, clean bitfield instead of
 /// raw hardware PTE bits. paging.rs's PAGE_* constants are an
@@ -425,6 +431,26 @@ impl MapError {
     }
 }
 
+// Let `?` lift the typed-boundary parse errors (paging.rs) into this
+// syscall's own error space, so the checks can live in the type constructors
+// while dispatch_frame_map still reports the exact same codes it always has.
+impl From<paging::VaddrError> for MapError {
+    fn from(e: paging::VaddrError) -> Self {
+        match e {
+            paging::VaddrError::Misaligned => MapError::Misaligned,
+            paging::VaddrError::NotPrivate => MapError::VaddrNotPrivate,
+        }
+    }
+}
+
+impl From<paging::AsError> for MapError {
+    fn from(e: paging::AsError) -> Self {
+        match e {
+            paging::AsError::IsKernel => MapError::AddressSpaceIsKernel,
+        }
+    }
+}
+
 /// Maps a Frame-Map Result onto the single-register return convention.
 /// +30 offset: the next free band after CSpaceError's bare 1-4,
 /// UntypedError's +10 (11-13), and ConfigureError's +20 (21-24), same
@@ -460,7 +486,6 @@ fn encode_map(result: Result<(), MapError>) -> u64 {
 pub fn dispatch_frame_map(arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
     let frame_cptr = arg1 as u32;
     let as_cptr = arg2 as u32;
-    let vaddr = arg3;
     let flag_bits = arg4;
 
     let result = scheduler::with_current_cspace(|cspace| -> Result<(), MapError> {
@@ -478,58 +503,39 @@ pub fn dispatch_frame_map(arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
             })
             .ok_or(MapError::InvalidAddressSpace)?;
 
-        if vaddr % mem::FRAME_SIZE != 0 {
-            return Err(MapError::Misaligned);
-        }
+        // Rule 1 (range): parse the raw address into a proof-carrying type.
+        // `try_user` runs the 4K-alignment and private-half checks that used
+        // to be inline here; it is the only way to obtain a UserVaddr, so the
+        // map call below cannot even be written with a raw u64. The shared-
+        // half rejection is the SYS_FRAME_MAP escalation fix (see
+        // docs/cores/kernel/BUGS.md), now carried by the type instead of by a
+        // guard a future call site could forget.
+        let vaddr = paging::UserVaddr::try_user(arg3)?;
 
-        // CRITICAL fix: reject any vaddr in the range every
-        // AddressSpace shares BY PHYSICAL REFERENCE with the kernel's
-        // own tables. Without this, a task holding only the default
-        // rights `retype` already grants (any Frame cap, any
-        // AddressSpace cap) could map an attacker-chosen frame
-        // directly over kernel .text -- with PAGE_USER set, executable
-        // -- from ring 3. See docs/cores/kernel/BUGS.md.
-        if paging::is_shared_vaddr(vaddr) {
-            return Err(MapError::VaddrNotPrivate);
-        }
+        // Rule 2 (target): narrow the AddressSpace to one proven not to be the
+        // kernel's own live tables. `into_user` is the only constructor for a
+        // UserAddressSpace, so `map_user_page` cannot be handed the kernel's.
+        let space = paging::AddressSpace::from_raw(as_cap.object_ref.0).into_user()?;
 
-        let address_space = paging::AddressSpace::from_raw(as_cap.object_ref.0);
-
-        // CRITICAL fix, independent of the vaddr check above: reject
-        // the kernel's own AddressSpace as a target outright. The
-        // vaddr check alone doesn't stop a task from mapping into the
-        // kernel AddressSpace's own PRIVATE (index<256) half -- still
-        // the exact same PML4 the kernel itself runs from.
-        if address_space.is_kernel() {
-            return Err(MapError::AddressSpaceIsKernel);
-        }
-
-        // Requesting a writable mapping out of a Frame cap that was
-        // never granted WRITE would let a read-only capability become
-        // writable memory just by picking a flag bit; reject it the
-        // same "rights gate what you can do, not just whether the cap
-        // exists" way every other syscall here already does.
-        if flag_bits & MAP_FLAG_WRITABLE != 0 && !frame_cap.rights.contains(Rights::WRITE) {
+        // Cap-rights gate (Rule 2, rights half): a writable mapping requires a
+        // Frame cap that actually carries WRITE. Stays here; it is a
+        // capability concern, not a data-shape one.
+        let want_write = flag_bits & MAP_FLAG_WRITABLE != 0;
+        if want_write && !frame_cap.rights.contains(Rights::WRITE) {
             return Err(MapError::InvalidFrame);
         }
 
-        let mut flags = paging::PAGE_USER;
-        if flag_bits & MAP_FLAG_WRITABLE != 0 {
-            flags |= paging::PAGE_WRITABLE;
-        }
-        // HIGH fix (W^X): a writable mapping is never also executable
-        // through this syscall, regardless of whether the caller
-        // separately asked for MAP_FLAG_NO_EXECUTE. Previously the two
-        // flag bits were independent, so MAP_FLAG_WRITABLE alone
-        // produced a page that was simultaneously writable and
-        // executable -- the exact policy paging::build()'s own kernel-
-        // image mapping documents itself as enforcing "from the very
-        // first kernel-owned page table".
-        if flag_bits & MAP_FLAG_NO_EXECUTE != 0 || flag_bits & MAP_FLAG_WRITABLE != 0 {
-            flags |= paging::PAGE_NO_EXECUTE;
-        }
+        // Rule 3 (flags): W^X is enforced by the type. `UserMapFlags::user`
+        // always sets PAGE_USER and forces PAGE_NO_EXECUTE on any writable
+        // mapping, so a W+X page cannot be constructed here regardless of what
+        // the caller requested -- same policy the old inline code enforced,
+        // now structural.
+        let want_nx = flag_bits & MAP_FLAG_NO_EXECUTE != 0;
+        let flags = paging::UserMapFlags::user(want_write, want_nx);
 
-        unsafe { address_space.map_page(vaddr, frame_cap.object_ref.0, flags) };
+        // The use. Every argument is a proof-carrying type, so the checks are
+        // not standing in front of this call; they are its only ingredients.
+        space.map_user_page(vaddr, frame_cap.object_ref.0, flags);
         Ok(())
     });
 

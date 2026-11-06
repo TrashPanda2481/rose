@@ -32,7 +32,10 @@ use crate::scheduler;
 use crate::serial;
 use crate::syscall;
 use crate::timer;
+#[cfg(feature = "usermode_selftest")]
 use crate::usermode;
+#[cfg(not(feature = "usermode_selftest"))]
+use crate::root;
 
 /// Software interrupt vector ring 3 code uses to call into the kernel.
 /// Arbitrary choice within the unused 33-255 range, 0x80 just matches
@@ -206,6 +209,18 @@ extern "C" fn rose_exception_handler(frame: *mut InterruptFrame) {
         // value ever used), the CSpace syscalls, and Retype. Routed by
         // number, not by anything structural, since all three arrive
         // the same way (int 0x80).
+        // Phase 1 root task's own report syscall (normal boot). Handled
+        // on its own path, ahead of and separate from the ring-3
+        // self-test's step-table hooks below, so the two never
+        // interleave. Compiled out under the usermode_selftest feature,
+        // where the root task does not run.
+        #[cfg(not(feature = "usermode_selftest"))]
+        if frame.regs.rax == syscall::SYS_ROOT_REPORT {
+            root::on_report(frame.regs.rdi, frame.regs.rsi, frame.regs.rdx);
+            frame.regs.rax = 0;
+            return;
+        }
+
         if syscall::is_cspace_syscall(frame.regs.rax) {
             let num = frame.regs.rax;
             let arg1 = frame.regs.rdi;
@@ -213,6 +228,7 @@ extern "C" fn rose_exception_handler(frame: *mut InterruptFrame) {
             let arg3 = frame.regs.rdx;
             let arg4 = frame.regs.r10;
             let result = syscall::dispatch(num, arg1, arg2, arg3, arg4);
+            #[cfg(feature = "usermode_selftest")]
             usermode::on_cspace_syscall(num, arg1, arg2, arg3, arg4, result);
             // Written into the saved-register area common_stub will
             // pop rax from right before iretq, so this is what ring 3
@@ -224,6 +240,7 @@ extern "C" fn rose_exception_handler(frame: *mut InterruptFrame) {
             let arg2 = frame.regs.rsi;
             let arg3 = frame.regs.rdx;
             let result = syscall::dispatch_untyped(arg1, arg2, arg3);
+            #[cfg(feature = "usermode_selftest")]
             usermode::on_untyped_syscall(arg1, arg2, arg3, result);
             frame.regs.rax = result;
         } else if syscall::is_configure_syscall(frame.regs.rax) {
@@ -238,6 +255,7 @@ extern "C" fn rose_exception_handler(frame: *mut InterruptFrame) {
             // needed here, only reading one more field.
             let arg5 = frame.regs.r8;
             let result = syscall::dispatch_configure(arg1, arg2, arg3, arg4, arg5);
+            #[cfg(feature = "usermode_selftest")]
             usermode::on_configure_syscall(arg1, arg2, arg3, arg4, arg5, result);
             frame.regs.rax = result;
         } else if syscall::is_frame_map_syscall(frame.regs.rax) {
@@ -246,6 +264,7 @@ extern "C" fn rose_exception_handler(frame: *mut InterruptFrame) {
             let arg3 = frame.regs.rdx;
             let arg4 = frame.regs.r10;
             let result = syscall::dispatch_frame_map(arg1, arg2, arg3, arg4);
+            #[cfg(feature = "usermode_selftest")]
             usermode::on_frame_map_syscall(arg1, arg2, arg3, arg4, result);
             frame.regs.rax = result;
         } else if syscall::is_endpoint_send_syscall(frame.regs.rax) {
@@ -254,6 +273,7 @@ extern "C" fn rose_exception_handler(frame: *mut InterruptFrame) {
             let arg3 = frame.regs.rdx;
             let arg4 = frame.regs.r10;
             let result = syscall::dispatch_endpoint_send(arg1, arg2, arg3, arg4);
+            #[cfg(feature = "usermode_selftest")]
             usermode::on_endpoint_send_syscall(arg1, arg2, arg3, arg4, result);
             frame.regs.rax = result;
         } else if syscall::is_endpoint_receive_syscall(frame.regs.rax) {
@@ -273,6 +293,7 @@ extern "C" fn rose_exception_handler(frame: *mut InterruptFrame) {
             // what a resumed ring-3 Receive caller expects to find
             // per the ABI comment at the top of syscall.rs.
             let (result, label, data0, data1) = syscall::dispatch_endpoint_receive(arg1, arg2);
+            #[cfg(feature = "usermode_selftest")]
             usermode::on_endpoint_receive_syscall(arg1, arg2, result, label, data0, data1);
             frame.regs.rax = result;
             frame.regs.rsi = label;
@@ -288,6 +309,7 @@ extern "C" fn rose_exception_handler(frame: *mut InterruptFrame) {
             // Reply's response, not just a bare 0/error like Send.
             let (result, label, data0, data1) =
                 syscall::dispatch_endpoint_call(arg1, arg2, arg3, arg4);
+            #[cfg(feature = "usermode_selftest")]
             usermode::on_endpoint_call_syscall(arg1, arg2, arg3, arg4, result, label, data0, data1);
             frame.regs.rax = result;
             frame.regs.rsi = label;
@@ -301,9 +323,11 @@ extern "C" fn rose_exception_handler(frame: *mut InterruptFrame) {
             // Single output register only, same shape as Send: Reply
             // never hands back a value beyond success/failure.
             let result = syscall::dispatch_endpoint_reply(arg1, arg2, arg3, arg4);
+            #[cfg(feature = "usermode_selftest")]
             usermode::on_endpoint_reply_syscall(arg1, arg2, arg3, arg4, result);
             frame.regs.rax = result;
         } else {
+            #[cfg(feature = "usermode_selftest")]
             usermode::on_syscall(frame.regs.rax);
         }
         return;

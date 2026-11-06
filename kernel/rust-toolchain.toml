@@ -1,0 +1,8 @@
+# The kernel requires a nightly toolchain: the limine dependency uses
+# #![feature(ptr_metadata)], which is rejected on the stable channel.
+# Pinned to an exact nightly for reproducible builds (a floating "nightly"
+# can break without warning when an unstable feature changes). To bump:
+# pick a newer nightly, update the date below, and re-run tools/smoke-test.sh.
+[toolchain]
+channel = "nightly-2026-08-08"
+targets = ["x86_64-unknown-none"]

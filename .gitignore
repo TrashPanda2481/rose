@@ -2,5 +2,6 @@
 /iso_root/
 /rose.iso
 /.scratch/
+/.worktrees/
 /boot/limine-bootloader/limine
 *.log
