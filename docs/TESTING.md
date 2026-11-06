@@ -37,10 +37,12 @@ PAE/NX is not optional. The kernel enables `EFER.NXE` and sets the NX bit (bit 6
 
 BIOS over EFI is deliberate. The ISO is hybrid, but VirtualBox's EFI is unreliable booting from CD. VirtualBox's legacy BIOS is still a different implementation from QEMU's SeaBIOS, which is the whole point of the second opinion. Test the UEFI path with `tools/run-uefi.sh` (OVMF) instead.
 
-A clean boot shows both smoke-test lines in the serial log:
+A clean boot shows both smoke-test lines in the serial log. Both must be present, so check them separately; a single `grep -E "A|B"` passes when only one matches and masks a half-boot:
 
 ```
-grep -E "rose: hello, hardware|rose: root task: handoff ok" Log/rose-serial.log
+grep -q "rose: hello, hardware"           Log/rose-serial.log \
+  && grep -q "rose: root task: handoff ok" Log/rose-serial.log \
+  && echo PASS || echo FAIL
 ```
 
 ## Real hardware
